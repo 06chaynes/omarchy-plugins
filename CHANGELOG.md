@@ -54,3 +54,10 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added persistent notification center widget and history archive.
 - Integrated quick DND toggle via right-click on the bar bell icon.
 - Added support for searchable notification history, app grouping, and image attachment previews.
+
+## io.github.randazraik.xray
+
+- Added Omarchy X-Ray system trace overlay and launcher widget.
+- Support for process lineage inspection, resource graphs, open file descriptors, listening sockets, and container runtimes.
+- Built-in sensitive argument redaction and same-user process isolation.
+- Integrated into center bar layout.
