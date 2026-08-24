@@ -27,6 +27,11 @@ BarWidget {
 
     MouseArea {
       anchors.fill: parent
+      anchors.topMargin: (root.bar && root.bar.position === "top") ? root.bar.barSize : 0
+      anchors.bottomMargin: (root.bar && root.bar.position === "bottom") ? root.bar.barSize : 0
+      anchors.leftMargin: (root.bar && root.bar.position === "left") ? root.bar.barSize : 0
+      anchors.rightMargin: (root.bar && root.bar.position === "right") ? root.bar.barSize : 0
+
       onClicked: root.close()
     }
   }
