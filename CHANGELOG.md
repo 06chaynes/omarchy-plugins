@@ -41,10 +41,10 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Set default theme sync state to disabled.
 - Fixed popup anchoring so the panel opens directly beneath the bar button (`centerOnBar: false`).
 
-## remco.wireguard
+## glafeara.wireguard (Omawire)
 
-- Removed `statusSlot` constraint and set icon size to 16px (`Style.space(16)`).
-- Matched active status highlight to `Color.accent` and idle state to theme foreground.
-- Fixed ping measurement logic to auto-detect subnet gateway or accept configurable `pingTarget`.
-- Added configurable `endpoint` and `pingTarget` settings schema to `manifest.json`.
-- Translated Dutch strings to English in the details panel and status script.
+- Switched to `glafeara.wireguard` (Omawire) for full NetworkManager multi-tunnel management.
+- Transactional tunnel switching, config import from file/clipboard, in-place rename, and editing.
+- Added on-screen QR code export for mobile device pairing.
+- Real-time traffic rate and total counters.
+- Subnet gateway ping latency probing with configurable `pingHost` setting.

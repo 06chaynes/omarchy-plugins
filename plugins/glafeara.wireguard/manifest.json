@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "glafeara.wireguard",
+  "name": "Omawire",
+  "version": "2.5.1",
+  "author": "glafeara",
+  "license": "MIT",
+  "description": "Tunnel status, transactional switching, import, rename, QR export, live traffic and drop notifications in the Omarchy bar. Unofficial third-party widget for WireGuard tunnels; not affiliated with the WireGuard project.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Omawire",
+    "description": "Toggle, switch and rename NetworkManager WireGuard tunnels, import .conf files, show QR codes, watch traffic, get a toast when a tunnel drops. No sudo required.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "pingHost": "1.1.1.1"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 3600,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "pingHost",
+        "type": "string",
+        "label": "Ping host (empty disables the latency probe)",
+        "defaultValue": "1.1.1.1"
+      }
+    ]
+  }
+}
