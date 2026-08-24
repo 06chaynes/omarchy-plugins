@@ -15,6 +15,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Dropdown Terminal** | [`io.github.tuthan.dropdown-terminal`](plugins/io.github.tuthan.dropdown-terminal) | Floating dropdown terminal for special workspaces. | [tuthan/omarchy-dropdown-terminal](https://github.com/tuthan/omarchy-dropdown-terminal.git) |
 | **Philips Hue Control** | [`omarchy-philips-hue`](plugins/omarchy-philips-hue) | Philips Hue light controls with Omarchy theme color synchronization. | [sethchev/omarchy-philips-hue](https://github.com/sethchev/omarchy-philips-hue.git) |
 | **Omawire (WireGuard)** | [`glafeara.wireguard`](plugins/glafeara.wireguard) | WireGuard tunnel manager with multi-tunnel switching, live traffic, QR code export, and import. | [glafeara/omarchy-wireguard](https://github.com/glafeara/omarchy-wireguard.git) |
+| **Notification Center** | [`jankeesvw.notification-center`](plugins/jankeesvw.notification-center) | Persistent notification history archive, DND controls, and notification drawer. | [jankeesvw/omarchy-notification-center](https://github.com/jankeesvw/omarchy-notification-center.git) |
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 
 ## Installation

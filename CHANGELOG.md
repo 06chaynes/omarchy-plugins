@@ -48,3 +48,9 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added on-screen QR code export for mobile device pairing.
 - Real-time traffic rate and total counters.
 - Subnet gateway ping latency probing with configurable `pingHost` setting.
+
+## jankeesvw.notification-center
+
+- Added persistent notification center widget and history archive.
+- Integrated quick DND toggle via right-click on the bar bell icon.
+- Added support for searchable notification history, app grouping, and image attachment previews.
