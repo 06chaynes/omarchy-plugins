@@ -85,6 +85,16 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Status bar widget with 5 right-click cyclable display modes (Size, Count, Detailed, Status, IconOnly) and middle-click rescan.
 - Integrated into center bar layout.
 
+## io.github.06chaynes.github-tracker
+
+- Added GitHub Tracker & CI Alerts dashboard and bar widget plugin.
+- Direct GraphQL and REST API querying via authenticated `gh` CLI credentials (zero token storage).
+- 5-tab developer dashboard covering failing/running CI Action Alerts, live Actions Log, Review Requests, authored Pull Requests, and Pinned/Org Repositories.
+- Multi-organization support with account switcher dropdown (`O`) for scoped filtering across personal and organizational memberships.
+- Status bar widget with Octocat glyph and live dynamic badges for failing actions, review requests, and open authored PRs.
+- 3 cyclable bar display modes (`BadgeCounts`, `AlertsOnly`, `IconOnly`), keyboard navigation (`1`-`5`, `O`, `/`, `R`, `Esc`), and instant background cache loading.
+- Integrated into center bar layout.
+
 ## io.github.agata.omanano
 
 - Added OmaNano Notes local-first Markdown notes library.

@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""GitHub Tracker & CI Alerts CLI Engine for Omarchy."""
+
+import sys
+import os
+import json
+import subprocess
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+CONFIG_FILE = Path(os.path.expanduser("~/.config/omarchy/github-tracker.json"))
+CACHE_FILE = Path(os.path.expanduser("~/.cache/omarchy/github-tracker-cache.json"))
+
+DEFAULT_CONFIG = {
+    "customPinnedRepos": [],
+    "selectedOrg": "personal", # Default to personal account
+    "refreshIntervalSec": 300,
+    "barMode": "BadgeCounts",
+    "alertOnFailingCI": True
+}
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {**DEFAULT_CONFIG, **data}
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = CONFIG_FILE.with_suffix(".tmp")
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+    temp.replace(CONFIG_FILE)
+
+def load_cache():
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                if "organizations" not in d:
+                    d["organizations"] = []
+                if "selectedOrg" not in d:
+                    d["selectedOrg"] = "personal"
+                return d
+        except Exception:
+            pass
+    return None
+
+def save_cache(data):
+    CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temp = CACHE_FILE.with_suffix(".tmp")
+    with open(temp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    temp.replace(CACHE_FILE)
+
+def run_gh(args, timeout=25):
+    try:
+        res = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=timeout)
+        if res.returncode != 0:
+            return None, res.stderr.strip()
+        return res.stdout, None
+    except Exception as e:
+        return None, str(e)
+
+GRAPHQL_QUERY = """
+query {
+  viewer {
+    login
+    name
+    avatarUrl
+    organizations(first: 25) {
+      nodes {
+        login
+        name
+        avatarUrl
+        url
+        repositories(first: 30, orderBy: {field: PUSHED_AT, direction: DESC}) {
+          totalCount
+          nodes {
+            nameWithOwner
+            name
+            owner { login }
+            isPrivate
+            isFork
+            isArchived
+            pushedAt
+            stargazerCount
+            url
+            defaultBranchRef {
+              name
+              target {
+                ... on Commit {
+                  oid
+                  messageHeadline
+                  committedDate
+                  statusCheckRollup {
+                    state
+                  }
+                }
+              }
+            }
+            issues(states: [OPEN]) {
+              totalCount
+            }
+            pullRequests(states: [OPEN]) {
+              totalCount
+            }
+          }
+        }
+      }
+    }
+    pinnedItems(first: 10, types: [REPOSITORY]) {
+      totalCount
+      nodes {
+        ... on Repository {
+          nameWithOwner
+          name
+          owner { login }
+          isPrivate
+          isFork
+          isArchived
+          pushedAt
+          stargazerCount
+          url
+          defaultBranchRef {
+            name
+            target {
+              ... on Commit {
+                oid
+                messageHeadline
+                committedDate
+                statusCheckRollup {
+                  state
+                }
+              }
+            }
+          }
+          issues(states: [OPEN]) {
+            totalCount
+          }
+          pullRequests(states: [OPEN]) {
+            totalCount
+          }
+        }
+      }
+    }
+    repositories(first: 70, affiliations: [OWNER, COLLABORATOR, ORGANIZATION_MEMBER], orderBy: {field: PUSHED_AT, direction: DESC}) {
+      nodes {
+        nameWithOwner
+        name
+        owner { login }
+        isPrivate
+        isFork
+        isArchived
+        pushedAt
+        stargazerCount
+        url
+        defaultBranchRef {
+          name
+          target {
+            ... on Commit {
+              oid
+              messageHeadline
+              committedDate
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
+        issues(states: [OPEN]) {
+          totalCount
+        }
+        pullRequests(states: [OPEN]) {
+          totalCount
+        }
+      }
+    }
+  }
+  reviewRequests: search(query: "type:pr state:open review-requested:@me", type: ISSUE, first: 30) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        createdAt
+        updatedAt
+        isDraft
+        author {
+          login
+          avatarUrl
+        }
+        repository {
+          nameWithOwner
+          owner { login }
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  myPullRequests: search(query: "type:pr state:open author:@me", type: ISSUE, first: 30) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        createdAt
+        updatedAt
+        isDraft
+        headRefName
+        baseRefName
+        reviewDecision
+        repository {
+          nameWithOwner
+          owner { login }
+        }
+        commits(last: 1) {
+          nodes {
+            commit {
+              statusCheckRollup {
+                state
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  rateLimit {
+    limit
+    remaining
+    resetAt
+  }
+}
+"""
+
+def parse_repo_node(r, is_pinned=False, is_profile_pinned=False):
+    if not r: return None
+    name_with_owner = r.get("nameWithOwner", "")
+    owner_login = (r.get("owner") or {}).get("login", "")
+    branch_ref = r.get("defaultBranchRef") or {}
+    target = branch_ref.get("target") or {}
+    rollup = target.get("statusCheckRollup") or {}
+    ci_state = rollup.get("state", "NONE")
+
+    return {
+        "nameWithOwner": name_with_owner,
+        "name": r.get("name", ""),
+        "owner": owner_login,
+        "url": r.get("url", ""),
+        "isPrivate": r.get("isPrivate", False),
+        "isFork": r.get("isFork", False),
+        "isArchived": r.get("isArchived", False),
+        "pushedAt": r.get("pushedAt", ""),
+        "stargazerCount": r.get("stargazerCount", 0),
+        "openIssues": r.get("issues", {}).get("totalCount", 0),
+        "openPrs": r.get("pullRequests", {}).get("totalCount", 0),
+        "defaultBranch": branch_ref.get("name", "main"),
+        "latestCommit": target.get("messageHeadline", ""),
+        "ciState": ci_state,
+        "isPinned": is_pinned,
+        "isProfilePinned": is_profile_pinned
+    }
+
+def fetch_repo_actions(repo_name):
+    res_stdout, res_err = run_gh(["api", f"/repos/{repo_name}/actions/runs?per_page=6"], timeout=10)
+    runs = []
+    if res_stdout:
+        try:
+            data = json.loads(res_stdout)
+            for r in data.get("workflow_runs", []):
+                runs.append({
+                    "id": r.get("id"),
+                    "repository": repo_name,
+                    "name": r.get("name", "Workflow"),
+                    "headBranch": r.get("head_branch", "main"),
+                    "headSha": (r.get("head_sha") or "")[:7],
+                    "commitMessage": ((r.get("head_commit") or {}).get("message") or "").split("\n")[0],
+                    "actor": ((r.get("actor") or {}).get("login") or ""),
+                    "event": r.get("event", "push"),
+                    "status": r.get("status", "completed"),
+                    "conclusion": r.get("conclusion") or (r.get("status") if r.get("status") != "completed" else "unknown"),
+                    "url": r.get("html_url", ""),
+                    "createdAt": r.get("created_at", ""),
+                    "updatedAt": r.get("updated_at", "")
+                })
+        except Exception:
+            pass
+    return runs
+
+def fetch_data():
+    config = load_config()
+    custom_pinned_set = set(config.get("customPinnedRepos", []))
+    selected_org = config.get("selectedOrg", "personal")
+
+    stdout, err = run_gh(["api", "graphql", "-f", f"query={GRAPHQL_QUERY}"], timeout=25)
+    if err or not stdout:
+        cached = load_cache()
+        if cached:
+            return cached
+        return {
+            "ok": False,
+            "error": err or "Failed to query GitHub API. Ensure 'gh auth login' is completed.",
+            "login": "",
+            "selectedOrg": selected_org,
+            "organizations": [],
+            "pinnedRepos": [],
+            "allRepos": [],
+            "myPullRequests": [],
+            "reviewRequests": [],
+            "actionAlerts": [],
+            "actionRuns": [],
+            "stats": {
+                "failingActionsCount": 0,
+                "reviewRequestsCount": 0,
+                "myPrsCount": 0,
+                "pinnedCount": 0,
+                "runningActionsCount": 0
+            }
+        }
+
+    try:
+        data = json.loads(stdout)["data"]
+    except Exception as e:
+        cached = load_cache()
+        if cached: return cached
+        return {"ok": False, "error": f"Failed to parse GraphQL response: {e}"}
+
+    viewer = data.get("viewer") or {}
+    login = viewer.get("login", "")
+    profile_pinned_nodes = viewer.get("pinnedItems", {}).get("nodes", [])
+    all_repo_nodes = viewer.get("repositories", {}).get("nodes", [])
+    org_nodes = viewer.get("organizations", {}).get("nodes", [])
+
+    organizations = []
+    org_repo_nodes = []
+    for o in org_nodes:
+        if not o: continue
+        org_repos = (o.get("repositories") or {}).get("nodes", [])
+        org_repo_nodes.extend(org_repos)
+        organizations.append({
+            "login": o.get("login", ""),
+            "name": o.get("name") or o.get("login", ""),
+            "avatarUrl": o.get("avatarUrl", ""),
+            "url": o.get("url", ""),
+            "repoCount": (o.get("repositories") or {}).get("totalCount", 0)
+        })
+
+    profile_pinned_names = set(r["nameWithOwner"] for r in profile_pinned_nodes if r and "nameWithOwner" in r)
+    all_pinned_names = profile_pinned_names.union(custom_pinned_set)
+
+    processed_repos_map = {}
+    action_alerts = []
+
+    # 1. Add Profile Pinned Repos
+    for r in profile_pinned_nodes:
+        if not r: continue
+        parsed = parse_repo_node(r, is_pinned=True, is_profile_pinned=True)
+        if parsed:
+            processed_repos_map[parsed["nameWithOwner"]] = parsed
+
+    # 2. Add Organization Repos
+    for r in org_repo_nodes:
+        if not r: continue
+        name = r.get("nameWithOwner", "")
+        is_pinned = name in all_pinned_names
+        is_profile = name in profile_pinned_names
+        if name not in processed_repos_map:
+            parsed = parse_repo_node(r, is_pinned=is_pinned, is_profile_pinned=is_profile)
+            if parsed:
+                processed_repos_map[name] = parsed
+
+    # 3. Add Personal / Viewer Repos
+    for r in all_repo_nodes:
+        if not r: continue
+        name = r.get("nameWithOwner", "")
+        is_pinned = name in all_pinned_names
+        is_profile = name in profile_pinned_names
+        if name not in processed_repos_map:
+            parsed = parse_repo_node(r, is_pinned=is_pinned, is_profile_pinned=is_profile)
+            if parsed:
+                processed_repos_map[name] = parsed
+
+    all_repos = list(processed_repos_map.values())
+    pinned_repos = [r for r in all_repos if r["isPinned"]]
+
+    # Collect target repos for Action Runs:
+    # 1. All pinned repos
+    # 2. Key active org repos with recent pushes (like MantisPlatform/mantis, actori, etc.)
+    target_action_repos = list(set([r["nameWithOwner"] for r in pinned_repos]))
+    # Add top 10 most recently pushed org/personal repos that are not already in target
+    sorted_by_push = sorted(all_repos, key=lambda x: x.get("pushedAt") or "", reverse=True)
+    for r in sorted_by_push:
+        if r["nameWithOwner"] not in target_action_repos and len(target_action_repos) < 16:
+            target_action_repos.append(r["nameWithOwner"])
+
+    action_runs = []
+    if target_action_repos:
+        with ThreadPoolExecutor(max_workers=min(10, len(target_action_repos))) as executor:
+            run_results = executor.map(fetch_repo_actions, target_action_repos)
+            for runs in run_results:
+                action_runs.extend(runs)
+        action_runs.sort(key=lambda x: x.get("createdAt") or "", reverse=True)
+
+    # Action Alerts across pinned repos & active branches
+    for r in all_repos:
+        if r["isPinned"] or r["nameWithOwner"] in target_action_repos:
+            if r["ciState"] in ("FAILURE", "ERROR"):
+                action_alerts.append({
+                    "kind": "default_branch",
+                    "repository": r["nameWithOwner"],
+                    "title": f"Default branch '{r['defaultBranch']}' CI failing",
+                    "commit": r["latestCommit"],
+                    "url": f"{r['url']}/actions",
+                    "state": r["ciState"]
+                })
+            elif r["ciState"] == "PENDING":
+                action_alerts.append({
+                    "kind": "running",
+                    "repository": r["nameWithOwner"],
+                    "title": f"Workflows running on '{r['defaultBranch']}'",
+                    "commit": r["latestCommit"],
+                    "url": f"{r['url']}/actions",
+                    "state": r["ciState"]
+                })
+
+    # Review Requests
+    review_nodes = data.get("reviewRequests", {}).get("nodes", [])
+    review_requests = []
+    for pr in review_nodes:
+        if not pr: continue
+        commits = pr.get("commits", {}).get("nodes", [])
+        last_commit = commits[0].get("commit", {}) if commits else {}
+        ci_state = (last_commit.get("statusCheckRollup") or {}).get("state", "NONE")
+        repo_info = pr.get("repository") or {}
+        
+        review_requests.append({
+            "number": pr.get("number"),
+            "title": pr.get("title", ""),
+            "url": pr.get("url", ""),
+            "createdAt": pr.get("createdAt", ""),
+            "updatedAt": pr.get("updatedAt", ""),
+            "isDraft": pr.get("isDraft", False),
+            "author": (pr.get("author") or {}).get("login", ""),
+            "authorAvatar": (pr.get("author") or {}).get("avatarUrl", ""),
+            "repository": repo_info.get("nameWithOwner", ""),
+            "owner": (repo_info.get("owner") or {}).get("login", ""),
+            "ciState": ci_state
+        })
+
+    # My Pull Requests
+    my_pr_nodes = data.get("myPullRequests", {}).get("nodes", [])
+    my_pull_requests = []
+    for pr in my_pr_nodes:
+        if not pr: continue
+        commits = pr.get("commits", {}).get("nodes", [])
+        last_commit = commits[0].get("commit", {}) if commits else {}
+        ci_state = (last_commit.get("statusCheckRollup") or {}).get("state", "NONE")
+        repo_info = pr.get("repository") or {}
+
+        pr_item = {
+            "number": pr.get("number"),
+            "title": pr.get("title", ""),
+            "url": pr.get("url", ""),
+            "createdAt": pr.get("createdAt", ""),
+            "updatedAt": pr.get("updatedAt", ""),
+            "isDraft": pr.get("isDraft", False),
+            "headRef": pr.get("headRefName", ""),
+            "baseRef": pr.get("baseRefName", ""),
+            "reviewDecision": pr.get("reviewDecision", "REVIEW_REQUIRED"),
+            "repository": repo_info.get("nameWithOwner", ""),
+            "owner": (repo_info.get("owner") or {}).get("login", ""),
+            "ciState": ci_state
+        }
+        my_pull_requests.append(pr_item)
+
+        if ci_state in ("FAILURE", "ERROR"):
+            action_alerts.append({
+                "kind": "pull_request",
+                "repository": pr_item["repository"],
+                "title": f"PR #{pr_item['number']}: {pr_item['title']}",
+                "commit": f"Checks failing on {pr_item['headRef']}",
+                "url": pr_item["url"],
+                "state": ci_state
+            })
+
+    failing_count = sum(1 for a in action_alerts if a["state"] in ("FAILURE", "ERROR"))
+    running_count = sum(1 for r in action_runs if r["status"] in ("in_progress", "queued", "waiting"))
+
+    result = {
+        "ok": True,
+        "login": login,
+        "name": viewer.get("name", ""),
+        "avatarUrl": viewer.get("avatarUrl", ""),
+        "selectedOrg": selected_org,
+        "organizations": organizations,
+        "fetchedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "pinnedRepos": pinned_repos,
+        "allRepos": all_repos,
+        "myPullRequests": my_pull_requests,
+        "reviewRequests": review_requests,
+        "actionAlerts": action_alerts,
+        "actionRuns": action_runs,
+        "stats": {
+            "failingActionsCount": failing_count,
+            "reviewRequestsCount": len(review_requests),
+            "myPrsCount": len(my_pull_requests),
+            "pinnedCount": len(pinned_repos),
+            "runningActionsCount": running_count,
+            "actionRunsCount": len(action_runs),
+            "totalRepoCount": len(all_repos),
+            "orgCount": len(organizations)
+        },
+        "rateLimit": data.get("rateLimit", {})
+    }
+
+    save_cache(result)
+    return result
+
+def set_org(org_name):
+    config = load_config()
+    config["selectedOrg"] = org_name
+    save_config(config)
+    cached = load_cache()
+    if cached:
+        cached["selectedOrg"] = org_name
+        save_cache(cached)
+        return cached
+    return fetch_data()
+
+def toggle_pin(repo_name):
+    config = load_config()
+    pinned = config.get("customPinnedRepos", [])
+    if repo_name in pinned:
+        pinned.remove(repo_name)
+    else:
+        pinned.append(repo_name)
+    config["customPinnedRepos"] = pinned
+    save_config(config)
+    return fetch_data()
+
+def pin_repo(repo_name):
+    config = load_config()
+    pinned = config.get("customPinnedRepos", [])
+    if repo_name not in pinned:
+        pinned.append(repo_name)
+        config["customPinnedRepos"] = pinned
+        save_config(config)
+    return fetch_data()
+
+def unpin_repo(repo_name):
+    config = load_config()
+    pinned = config.get("customPinnedRepos", [])
+    if repo_name in pinned:
+        pinned.remove(repo_name)
+        config["customPinnedRepos"] = pinned
+        save_config(config)
+    return fetch_data()
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("fetch", "json"):
+        result = fetch_data()
+        print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "cache":
+        cached = load_cache()
+        if cached:
+            print(json.dumps(cached, indent=2))
+        else:
+            result = fetch_data()
+            print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "set-org" and len(sys.argv) > 2:
+        result = set_org(sys.argv[2])
+        print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "toggle-pin" and len(sys.argv) > 2:
+        result = toggle_pin(sys.argv[2])
+        print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "pin" and len(sys.argv) > 2:
+        result = pin_repo(sys.argv[2])
+        print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "unpin" and len(sys.argv) > 2:
+        result = unpin_repo(sys.argv[2])
+        print(json.dumps(result, indent=2))
+    elif sys.argv[1] == "config":
+        print(json.dumps(load_config(), indent=2))
+    else:
+        print(json.dumps({"ok": False, "error": f"Unknown command: {sys.argv[1]}"}))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.06chaynes.github-tracker",
+  "name": "GitHub Tracker",
+  "version": "1.0.0",
+  "author": "Christian Haynes",
+  "license": "MIT",
+  "description": "High-signal GitHub dashboard tracking pinned repos, open PRs, review requests, and live CI/CD action alerts.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GitHub Tracker",
+    "description": "Track pinned repositories, review requests, pull requests, and CI/CD workflow health.",
+    "category": "Development",
+    "aliases": ["github", "gh", "prs", "actions", "ci"],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "refreshIntervalSec": 300,
+      "barMode": "BadgeCounts",
+      "alertOnFailingCI": true
+    },
+    "schema": [
+      { "key": "refreshIntervalSec", "type": "integer", "label": "Refresh interval (seconds)", "min": 60, "max": 3600, "step": 60, "defaultValue": 300 },
+      { "key": "barMode", "type": "enum", "label": "Bar display mode", "options": ["BadgeCounts", "AlertsOnly", "IconOnly"], "defaultValue": "BadgeCounts" },
+      { "key": "alertOnFailingCI", "type": "boolean", "label": "Alert on failing CI workflows", "defaultValue": true }
+    ]
+  }
+}
