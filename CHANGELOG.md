@@ -84,3 +84,12 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - 1-click desktop actions to launch default terminal (xdg-terminal-exec), default editor (omarchy-launch-editor), and file manager (xdg-open).
 - Status bar widget with 5 right-click cyclable display modes (Size, Count, Detailed, Status, IconOnly) and middle-click rescan.
 - Integrated into center bar layout.
+
+## io.github.agata.omanano
+
+- Added OmaNano Notes local-first Markdown notes library.
+- 3-pane library panel with live syntax highlighting, folder organization, full-text search, and trash recovery.
+- Detached tiled note window support (`Ctrl+Enter`) and full library window support (`Ctrl+Shift+Enter`).
+- Fixed missing `qs.Ui` import in `PlainTextDropdown.qml` to resolve `BorderSurface` type error.
+- Updated `BarWidget.qml` to use `BarIconButton` with 22px icon scaling.
+- Integrated into center bar layout.

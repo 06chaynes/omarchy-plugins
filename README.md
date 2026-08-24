@@ -20,6 +20,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Omarchy Sensei** | [`io.github.nilszeilon.omarchy-sensei`](plugins/io.github.nilszeilon.omarchy-sensei) | Keyboard-first coach that turns mouse habits into shortcut practice tasks. | [nilszeilon/omarchy-sensei](https://github.com/nilszeilon/omarchy-sensei.git) |
 | **Clipbasket** | [`clipbasket.clipboard`](plugins/clipbasket.clipboard) | Searchable clipboard history manager with category filters, image lightbox, and Markdown export. | [clipbasket/clipbasket-omarchy](https://github.com/clipbasket/clipbasket-omarchy.git) |
 | **Rust Workspaces** | [`io.github.06chaynes.rust-workspaces`](plugins/io.github.06chaynes.rust-workspaces) | Rust workspace discovery, build artifact monitor, disk bloat tracker, and target cleaner. | Local / Original |
+| **OmaNano Notes** | [`io.github.agata.omanano`](plugins/io.github.agata.omanano) | Local-first Markdown notes library with syntax highlighting, search, and Hyprland tiled window detaching. | [agata/omanano](https://github.com/agata/omanano.git) |
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 
 ## Installation
