@@ -1,44 +1,42 @@
-# Omarchy Plugins Collection
+# Omarchy Plugins
 
-A curated collection of third-party shell plugins and bar widgets for [Omarchy](https://omarchy.org/) (Quickshell-based Linux desktop shell).
+A collection of third-party shell plugins and bar widgets for Omarchy.
 
----
+## Plugins
 
-## 📦 Installed Plugins & Upstream Sources
-
-| Plugin Name | Plugin ID / Folder | Description | Upstream Repository |
+| Plugin | ID | Description | Upstream |
 | :--- | :--- | :--- | :--- |
-| **Is It Down?** | [`bottelet.is-it-down`](plugins/bottelet.is-it-down) | Monitors the status pages of developer services (GitHub, AWS, Cloudflare, npm, etc.) right from the bar. | [Bottelet/omarchy-is-it-down](https://github.com/Bottelet/omarchy-is-it-down.git) |
-| **System Monitor** | [`harshith.system-monitor`](plugins/harshith.system-monitor) | Low-overhead system resource monitor and dashboard for the Omarchy status bar. | [Harshith292002/omarchy-system-monitor](https://github.com/Harshith292002/omarchy-system-monitor.git) |
-| **Omaprox** | [`io.github.andressm415.omaprox`](plugins/io.github.andressm415.omaprox) | Proxmox VE dashboard for the status bar: container/VM status LEDs, per-guest stats, and one-click console access. | [AndresSM415/omaprox](https://github.com/AndresSM415/omaprox.git) |
-| **Detailed Weather** | [`io.github.calebhat.weather`](plugins/io.github.calebhat.weather) | Detailed weather widget with today's hourly forecast, 10-day outlook, city peek, and radar integration. | [calebhat/omarchy-weather](https://github.com/calebhat/omarchy-weather.git) |
-| **OmaRGB** | [`io.github.ilkaydnc.omargb`](plugins/io.github.ilkaydnc.omargb) | OpenRGB hardware lighting controller from the bar, synchronized with active Omarchy theme colors. | [ilkaydnc/omargb](https://github.com/ilkaydnc/omargb.git) |
-| **Omaherd** | [`io.github.salemsayed.omaherd`](plugins/io.github.salemsayed.omaherd) | Local and remote HerdR attention inbox integration for the Omarchy bar. | [salemsayed/omaherd](https://github.com/salemsayed/omaherd.git) |
-| **Dropdown Terminal** | [`io.github.tuthan.dropdown-terminal`](plugins/io.github.tuthan.dropdown-terminal) | Summon the configured default terminal in a floating special workspace via bar button or hotkey. | [tuthan/omarchy-dropdown-terminal](https://github.com/tuthan/omarchy-dropdown-terminal.git) |
-| **Philips Hue Control** | [`omarchy-philips-hue`](plugins/omarchy-philips-hue) | Control Philips Hue lights and sync room lighting with your active Omarchy desktop theme. *(Includes local pairing fixes)* | [sethchev/omarchy-philips-hue](https://github.com/sethchev/omarchy-philips-hue.git) |
-| **WireGuard** | [`remco.wireguard`](plugins/remco.wireguard) | WireGuard VPN status icon with connection details panel and `.conf` file import. | [r3mcos3/remco.wireguard](https://github.com/r3mcos3/remco.wireguard.git) |
-| **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | 1-bit interactive virtual desktop pet in your bar: feed, clean, cuddle, and let it roam your windows. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
+| **Is It Down?** | [`bottelet.is-it-down`](plugins/bottelet.is-it-down) | Service status page monitor with Azure, AWS, and Statuspage support. | [Bottelet/omarchy-is-it-down](https://github.com/Bottelet/omarchy-is-it-down.git) |
+| **System Monitor** | [`harshith.system-monitor`](plugins/harshith.system-monitor) | System resource monitor and dashboard for the status bar. | [Harshith292002/omarchy-system-monitor](https://github.com/Harshith292002/omarchy-system-monitor.git) |
+| **Omaprox** | [`io.github.andressm415.omaprox`](plugins/io.github.andressm415.omaprox) | Proxmox VE status dashboard with container and VM controls. | [AndresSM415/omaprox](https://github.com/AndresSM415/omaprox.git) |
+| **Detailed Weather** | [`io.github.calebhat.weather`](plugins/io.github.calebhat.weather) | Weather forecasts, radar integration, and condition indicators. | [calebhat/omarchy-weather](https://github.com/calebhat/omarchy-weather.git) |
+| **OmaRGB** | [`io.github.ilkaydnc.omargb`](plugins/io.github.ilkaydnc.omargb) | OpenRGB hardware lighting controller with theme synchronization. | [ilkaydnc/omargb](https://github.com/ilkaydnc/omargb.git) |
+| **Omaherd** | [`io.github.salemsayed.omaherd`](plugins/io.github.salemsayed.omaherd) | HerdR agent task and attention inbox integration. | [salemsayed/omaherd](https://github.com/salemsayed/omaherd.git) |
+| **Dropdown Terminal** | [`io.github.tuthan.dropdown-terminal`](plugins/io.github.tuthan.dropdown-terminal) | Floating dropdown terminal for special workspaces. | [tuthan/omarchy-dropdown-terminal](https://github.com/tuthan/omarchy-dropdown-terminal.git) |
+| **Philips Hue Control** | [`omarchy-philips-hue`](plugins/omarchy-philips-hue) | Philips Hue light controls with Omarchy theme color synchronization. | [sethchev/omarchy-philips-hue](https://github.com/sethchev/omarchy-philips-hue.git) |
+| **WireGuard** | [`remco.wireguard`](plugins/remco.wireguard) | WireGuard VPN connection status, metrics, and profile management. | [r3mcos3/remco.wireguard](https://github.com/r3mcos3/remco.wireguard.git) |
+| **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 
----
+## Installation
 
-## 🔧 Local Enhancements & Fixes
-
-### `omarchy-philips-hue`
-- **Fixed IP parsing in `pair.sh`:** Resolved Bash `IFS` variable scoping issue that prevented valid IP addresses from splitting correctly during bridge discovery.
-- **Support for alphanumeric Hue tokens:** Updated username validation to accept modern Base64/alphanumeric tokens generated by Hue Bridge firmware v1.78+.
-- **Active polling loop:** Added a 60-second polling retry loop with on-screen countdown for smooth bridge pairing.
-- **Terminal exit trap:** Added prompt to prevent terminal windows from closing before status messages can be read.
-
----
-
-## 🚀 Installation & Usage
-
-To install a plugin into your Omarchy environment:
+Copy any desired plugin directory to your local configuration:
 
 ```bash
-# Copy a plugin into ~/.config/omarchy/plugins/
-cp -r plugins/<plugin-folder> ~/.config/omarchy/plugins/
+cp -r plugins/<plugin-id> ~/.config/omarchy/plugins/
+```
 
-# Enable the plugin
+Enable the plugin:
+
+```bash
 omarchy plugin enable <plugin-id>
 ```
+
+Add the widget to your bar layout (in `~/.config/omarchy/shell.json`):
+
+```bash
+omarchy bar put <plugin-id>
+```
+
+## Changes and Maintenance
+
+See [CHANGELOG.md](CHANGELOG.md) for details on custom patches, layout adjustments, and bug fixes applied to plugins in this collection.
