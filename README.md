@@ -17,6 +17,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Omawire (WireGuard)** | [`glafeara.wireguard`](plugins/glafeara.wireguard) | WireGuard tunnel manager with multi-tunnel switching, live traffic, QR code export, and import. | [glafeara/omarchy-wireguard](https://github.com/glafeara/omarchy-wireguard.git) |
 | **Notification Center** | [`jankeesvw.notification-center`](plugins/jankeesvw.notification-center) | Persistent notification history archive, DND controls, and notification drawer. | [jankeesvw/omarchy-notification-center](https://github.com/jankeesvw/omarchy-notification-center.git) |
 | **Omarchy X-Ray** | [`io.github.randazraik.xray`](plugins/io.github.randazraik.xray) | Live process inspector and system trace overlay for windows, services, containers, ports, and devices. | [RandaZraik/omarchy-xray](https://github.com/RandaZraik/omarchy-xray.git) |
+| **Omarchy Sensei** | [`io.github.nilszeilon.omarchy-sensei`](plugins/io.github.nilszeilon.omarchy-sensei) | Keyboard-first coach that turns mouse habits into shortcut practice tasks. | [nilszeilon/omarchy-sensei](https://github.com/nilszeilon/omarchy-sensei.git) |
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 
 ## Installation

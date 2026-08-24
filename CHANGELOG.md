@@ -61,3 +61,9 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Support for process lineage inspection, resource graphs, open file descriptors, listening sockets, and container runtimes.
 - Built-in sensitive argument redaction and same-user process isolation.
 - Integrated into center bar layout.
+
+## io.github.nilszeilon.omarchy-sensei
+
+- Added Omarchy Sensei keyboard coaching widget and practice tracker.
+- Real-time mouse habit interception, automatic Super+K shortcut task generation, and lifetime leveling.
+- Integrated into right bar layout with task badge counter.
