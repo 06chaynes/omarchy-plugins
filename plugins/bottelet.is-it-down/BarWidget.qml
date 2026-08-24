@@ -72,7 +72,7 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    fontSize: Style.space(18)
+    fontSize: Style.space(22)
     text: root.issueCount > 0 ? "󰀦" : ""
     tooltipText: root.issueCount > 0
       ? "Is It Down? · " + root.issueCount + " issue" + (root.issueCount === 1 ? "" : "s")

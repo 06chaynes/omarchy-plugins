@@ -5,7 +5,7 @@ Item {
   id: root
 
   property color color: Color.foreground
-  property real iconSize: Style.font.icon
+  property real iconSize: Style.space(22)
   property string fontFamily: Style.font.family
 
   implicitWidth: iconSize

@@ -185,7 +185,7 @@ BarWidget {
         Item {
           SheepIcon {
             anchors.centerIn: parent
-            iconSize: Style.bar.iconFont
+            iconSize: Style.space(22)
             color: root.iconColor
             fontFamily: root.fontFamily
           }
