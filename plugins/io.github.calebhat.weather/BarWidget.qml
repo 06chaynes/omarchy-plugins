@@ -76,8 +76,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: panelLoader.item ? (panelLoader.item.barLabel || panelLoader.item.label || "") : ""
-    slotSize: Style.bar.statusSlot
+    fontSize: Style.space(26)
+    text: panelLoader.item ? (panelLoader.item.barLabel || panelLoader.item.label || "󰖕") : "󰖕"
     tooltipText: "Weather — click forecast, middle refresh, right notify"
 
     onPressed: function(b) {

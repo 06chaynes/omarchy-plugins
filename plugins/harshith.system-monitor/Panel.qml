@@ -262,8 +262,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.barLabel()
-    fontSize: Style.font.caption
-    horizontalMargin: 6
+    fontSize: Style.font.body
+    horizontalMargin: 8.75
+    verticalPadding: 8.75
     active: root.warning || root.critical
     activeColor: root.critical ? root.urgent : root.warningColor
     tooltipText: root.tooltipText()

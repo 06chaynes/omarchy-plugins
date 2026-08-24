@@ -67,8 +67,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
+    fontSize: Style.space(22)
     text: root.icon
-    slotSize: Style.bar.statusSlot
     tooltipText: service.busy
       ? "Opening terminal…"
       : "Left-click: terminal · Middle-click: settings · Right-click: bind Ctrl + Grave"

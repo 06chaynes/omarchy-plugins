@@ -813,7 +813,7 @@ KeyboardPanel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    centerOnBar: true
+    centerOnBar: false
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(540))
     contentHeight: panel.fittedContentHeight(Style.spacing.controlHeight + Style.space(12) + (root.mainView === "settings" ? settingsColumn.implicitHeight : weatherColumn.implicitHeight))
