@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""High-performance Rust Workspace Scanner & Management Engine for Omarchy."""
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))) / "omarchy"
+CONFIG_FILE = CONFIG_DIR / "rust-workspaces.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))) / "omarchy" / "rust-workspaces"
+CACHE_FILE = STATE_DIR / "cache.json"
+
+DEFAULT_CANDIDATE_ROOTS = [
+    "~/Projects",
+    "~/Work",
+    "~/src",
+    "~/code",
+    "~/dev",
+    "~/Repositories",
+    "~/github"
+]
+
+EXCLUDE_DIR_NAMES = {
+    ".git", ".cargo", ".rustup", ".cache", ".local", ".config",
+    "node_modules", "vendor", "build", "target", "venv", ".venv",
+    ".idea", ".vscode", "pkg", "dist"
+}
+
+def load_config() -> dict:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+            
+    # Default config
+    existing_roots = []
+    for r in DEFAULT_CANDIDATE_ROOTS:
+        exp = os.path.expanduser(r)
+        if os.path.isdir(exp) and exp not in existing_roots:
+            existing_roots.append(r)
+            
+    cfg = {
+        "scanRoots": existing_roots if existing_roots else ["~"],
+        "staleDaysThreshold": 14,
+        "sizeWarningThresholdGB": 20,
+        "useCargoClean": True
+    }
+    save_config(cfg)
+    return cfg
+
+def save_config(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+def format_bytes(bytes_num: int) -> str:
+    if bytes_num <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    val = float(bytes_num)
+    while val >= 1024.0 and i < len(units) - 1:
+        val /= 1024.0
+        i += 1
+    return f"{val:.1f} {units[i]}"
+
+def get_dir_size(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    total = 0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total += get_dir_size(Path(entry.path))
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+    return total
+
+def get_newest_mtime(path: Path) -> float:
+    if not path.is_dir():
+        return 0.0
+    newest = 0.0
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+                    if entry.is_dir(follow_symlinks=False):
+                        sub_mtime = get_newest_mtime(Path(entry.path))
+                        if sub_mtime > newest:
+                            newest = sub_mtime
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+    return newest
+
+def parse_cargo_toml(path: Path) -> dict:
+    result = {
+        "name": path.parent.name,
+        "version": "",
+        "edition": "",
+        "is_workspace": False,
+        "members": []
+    }
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+        in_package = False
+        in_workspace = False
+        
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                header = line[1:-1].strip()
+                in_package = (header == "package")
+                in_workspace = (header.startswith("workspace"))
+                continue
+            
+            if in_package and "=" in line:
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip('"\'')
+                if k == "name":
+                    result["name"] = v
+                elif k == "version":
+                    result["version"] = v
+                elif k == "edition":
+                    result["edition"] = v
+            elif in_workspace:
+                result["is_workspace"] = True
+                if "members" in line and "=" in line:
+                    parts = line.split("=", 1)[1].strip()
+                    if "[" in parts:
+                        result["is_workspace"] = True
+    except Exception:
+        pass
+    return result
+
+def get_git_branch(project_dir: Path) -> Optional[str]:
+    head_file = project_dir / ".git" / "HEAD"
+    if head_file.exists():
+        try:
+            line = head_file.read_text(encoding="utf-8").strip()
+            if line.startswith("ref: refs/heads/"):
+                return line[16:]
+            return line[:7]
+        except Exception:
+            pass
+    return None
+
+def scan_directory_for_cargo(root: Path) -> List[Path]:
+    workspaces = []
+    if not root.is_dir():
+        return workspaces
+        
+    def walk(current: Path, depth: int):
+        if depth > 5:
+            return
+        try:
+            cargo_file = current / "Cargo.toml"
+            if cargo_file.is_file():
+                workspaces.append(current)
+                # If this is a root workspace with a target or members, don't descend into sub-crates
+                return
+                
+            with os.scandir(current) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        name = entry.name
+                        if name in EXCLUDE_DIR_NAMES or (name.startswith(".") and depth > 0):
+                            continue
+                        walk(Path(entry.path), depth + 1)
+        except (OSError, PermissionError):
+            pass
+
+    walk(root, 0)
+    return workspaces
+
+def scan_all() -> dict:
+    cfg = load_config()
+    scan_roots = cfg.get("scanRoots", [])
+    
+    discovered_dirs = []
+    for r in scan_roots:
+        p = Path(os.path.expanduser(r)).resolve()
+        if p.is_dir():
+            for ws_path in scan_directory_for_cargo(p):
+                if ws_path not in discovered_dirs:
+                    discovered_dirs.append(ws_path)
+                    
+    now = time.time()
+    workspaces = []
+    total_reclaimable_bytes = 0
+    total_source_bytes = 0
+    
+    for ws_dir in discovered_dirs:
+        cargo_file = ws_dir / "Cargo.toml"
+        meta = parse_cargo_toml(cargo_file)
+        
+        target_dir = ws_dir / "target"
+        target_bytes = get_dir_size(target_dir) if target_dir.is_dir() else 0
+        total_reclaimable_bytes += target_bytes
+        
+        # Source bytes estimate (root files + src/ + tests/)
+        src_bytes = 0
+        for sub in ["src", "tests", "benches", "examples"]:
+            p = ws_dir / sub
+            if p.is_dir():
+                src_bytes += get_dir_size(p)
+        for f in ["Cargo.toml", "Cargo.lock", "README.md"]:
+            p = ws_dir / f
+            if p.is_file():
+                try:
+                    src_bytes += p.stat().st_size
+                except Exception:
+                    pass
+        total_source_bytes += src_bytes
+        
+        # Calculate days since last build
+        last_mtime = get_newest_mtime(target_dir) if target_dir.is_dir() else 0.0
+        days_since_build = int((now - last_mtime) / 86400) if last_mtime > 0 else -1
+        
+        display_path = str(ws_dir).replace(os.path.expanduser("~"), "~")
+        
+        workspaces.append({
+            "id": str(ws_dir),
+            "name": meta["name"],
+            "version": meta["version"],
+            "edition": meta["edition"],
+            "isWorkspace": meta["is_workspace"],
+            "path": str(ws_dir),
+            "displayPath": display_path,
+            "sourceBytes": src_bytes,
+            "sourceDisplay": format_bytes(src_bytes),
+            "targetBytes": target_bytes,
+            "targetDisplay": format_bytes(target_bytes),
+            "hasTarget": target_bytes > 0,
+            "daysSinceBuild": days_since_build,
+            "gitBranch": get_git_branch(ws_dir)
+        })
+        
+    # Sort by target size descending by default
+    workspaces.sort(key=lambda x: x["targetBytes"], reverse=True)
+    
+    summary = {
+        "count": len(workspaces),
+        "totalReclaimableBytes": total_reclaimable_bytes,
+        "totalReclaimableDisplay": format_bytes(total_reclaimable_bytes),
+        "totalSourceBytes": total_source_bytes,
+        "totalSourceDisplay": format_bytes(total_source_bytes),
+        "scanRoots": scan_roots,
+        "workspaces": workspaces,
+        "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    }
+    
+    # Write cache
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(summary, f)
+        
+    return summary
+
+def clean_workspace(path_str: str) -> dict:
+    p = Path(path_str).resolve()
+    if not p.is_dir() or not (p / "Cargo.toml").is_file():
+        return {"ok": False, "error": f"Invalid Rust workspace directory: {path_str}"}
+        
+    target_dir = p / "target"
+    if not target_dir.is_dir():
+        return {"ok": True, "reclaimedBytes": 0, "reclaimedDisplay": "0 B"}
+        
+    reclaimed_bytes = get_dir_size(target_dir)
+    
+    # 1. Run cargo clean with sanitized environment (unset CARGO_TARGET_DIR)
+    if shutil.which("cargo"):
+        try:
+            clean_env = {k: v for k, v in os.environ.items() if k != "CARGO_TARGET_DIR"}
+            subprocess.run(
+                ["cargo", "clean", "--manifest-path", str(p / "Cargo.toml")],
+                cwd=str(p),
+                capture_output=True,
+                timeout=30,
+                env=clean_env
+            )
+        except Exception:
+            pass
+            
+    # 2. If target directory still exists, remove it directly
+    if target_dir.exists():
+        try:
+            shutil.rmtree(target_dir, ignore_errors=True)
+        except Exception:
+            pass
+            
+    return {
+        "ok": True,
+        "path": str(p),
+        "reclaimedBytes": reclaimed_bytes,
+        "reclaimedDisplay": format_bytes(reclaimed_bytes)
+    }
+
+def clean_batch(paths: list) -> dict:
+    total_reclaimed = 0
+    results = []
+    for p in paths:
+        res = clean_workspace(p)
+        if res.get("ok"):
+            total_reclaimed += res.get("reclaimedBytes", 0)
+        results.append(res)
+    return {
+        "ok": True,
+        "count": len(paths),
+        "totalReclaimedBytes": total_reclaimed,
+        "totalReclaimedDisplay": format_bytes(total_reclaimed),
+        "results": results
+    }
+
+def clean_stale(stale_days: int = 14) -> dict:
+    cached = scan_all()
+    to_clean = []
+    for ws in cached.get("workspaces", []):
+        if ws.get("hasTarget") and ws.get("daysSinceBuild", 0) >= stale_days:
+            to_clean.append(ws["path"])
+    return clean_batch(to_clean)
+
+def open_terminal(path_str: str):
+    p = Path(path_str).resolve()
+    if shutil.which("uwsm-app") and shutil.which("xdg-terminal-exec"):
+        subprocess.Popen(["uwsm-app", "--", "xdg-terminal-exec", f"--dir={str(p)}"], start_new_session=True)
+        return True
+    if shutil.which("xdg-terminal-exec"):
+        subprocess.Popen(["xdg-terminal-exec", f"--dir={str(p)}"], start_new_session=True)
+        return True
+    if shutil.which("foot"):
+        subprocess.Popen(["foot", "-D", str(p)], start_new_session=True)
+        return True
+    term = os.environ.get("TERMINAL") or "xterm"
+    subprocess.Popen([term], cwd=str(p), start_new_session=True)
+    return True
+
+def open_editor(path_str: str):
+    p = Path(path_str).resolve()
+    if shutil.which("omarchy-launch-editor"):
+        subprocess.Popen(["omarchy-launch-editor", str(p)], cwd=str(p), start_new_session=True)
+        return True
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nvim"
+    if editor in ["nvim", "vim", "nano", "hx", "emacs", "helix"]:
+        term = os.environ.get("TERMINAL") or "xdg-terminal-exec"
+        subprocess.Popen([term, "-e", editor, str(p)], cwd=str(p), start_new_session=True)
+    else:
+        subprocess.Popen([editor, str(p)], cwd=str(p), start_new_session=True)
+    return True
+
+def open_files(path_str: str):
+    p = Path(path_str).resolve()
+    subprocess.Popen(["xdg-open", str(p)], cwd=str(p), start_new_session=True)
+    return True
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps(scan_all()))
+        return
+        
+    cmd = sys.argv[1]
+    if cmd in ["scan", "status", "list"]:
+        print(json.dumps(scan_all()))
+    elif cmd == "clean" and len(sys.argv) >= 3:
+        print(json.dumps(clean_workspace(sys.argv[2])))
+    elif cmd == "clean-batch" and len(sys.argv) >= 3:
+        paths = sys.argv[2:]
+        print(json.dumps(clean_batch(paths)))
+    elif cmd == "clean-stale":
+        days = int(sys.argv[2]) if len(sys.argv) >= 3 else 14
+        print(json.dumps(clean_stale(days)))
+    elif cmd == "roots-get":
+        cfg = load_config()
+        print(json.dumps(cfg.get("scanRoots", [])))
+    elif cmd == "roots-add" and len(sys.argv) >= 3:
+        new_root = sys.argv[2]
+        cfg = load_config()
+        roots = cfg.get("scanRoots", [])
+        if new_root not in roots:
+            roots.append(new_root)
+            cfg["scanRoots"] = roots
+            save_config(cfg)
+        print(json.dumps(scan_all()))
+    elif cmd == "roots-remove" and len(sys.argv) >= 3:
+        to_rem = sys.argv[2]
+        cfg = load_config()
+        roots = [r for r in cfg.get("scanRoots", []) if r != to_rem]
+        cfg["scanRoots"] = roots
+        save_config(cfg)
+        print(json.dumps(scan_all()))
+    elif cmd == "open-term" and len(sys.argv) >= 3:
+        open_terminal(sys.argv[2])
+    elif cmd == "open-editor" and len(sys.argv) >= 3:
+        open_editor(sys.argv[2])
+    elif cmd == "open-files" and len(sys.argv) >= 3:
+        open_files(sys.argv[2])
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

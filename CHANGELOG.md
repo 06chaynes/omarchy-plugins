@@ -74,3 +74,13 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Filter by Text, Links, Images, Files, and Saved/Pinned clips.
 - Support for HTML-to-Markdown conversion, image dimensions lightbox, and password manager privacy filtering.
 - Integrated into right bar layout.
+
+## io.github.06chaynes.rust-workspaces
+
+- Added Rust Workspaces manager and target cleaner plugin.
+- Fast non-blocking discovery of Rust workspaces across development roots (~/Projects, ~/Work, ~/src, ~/code, ~/dev, ~/Repositories, ~/github).
+- Disk usage inspection comparing source code size against disposable target/ build artifacts.
+- Single workspace clean, multi-select batch clean, and stale build clean (>14d).
+- 1-click desktop actions to launch default terminal (xdg-terminal-exec), default editor (omarchy-launch-editor), and file manager (xdg-open).
+- Status bar widget with 5 right-click cyclable display modes (Size, Count, Detailed, Status, IconOnly) and middle-click rescan.
+- Integrated into center bar layout.

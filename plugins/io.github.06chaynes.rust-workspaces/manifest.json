@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.06chaynes.rust-workspaces",
+  "name": "Rust Workspaces",
+  "version": "1.0.0",
+  "author": "Christian Haynes",
+  "license": "MIT",
+  "description": "Discover, inspect, and clean Rust workspaces across your system to reclaim disk space from target builds.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Rust Workspaces",
+    "description": "Rust workspace manager and target cleaner",
+    "category": "Development",
+    "aliases": [
+      "rust",
+      "cargo",
+      "cargo-clean",
+      "workspaces"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "barMode": "Size"
+    },
+    "schema": [
+      {
+        "key": "barMode",
+        "type": "enum",
+        "label": "Bar display",
+        "options": ["Size", "Count", "Detailed", "Status", "IconOnly"],
+        "defaultValue": "Size"
+      }
+    ]
+  }
+}
