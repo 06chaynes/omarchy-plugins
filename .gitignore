@@ -4,3 +4,10 @@ __pycache__/
 .DS_Store
 *.swp
 *.bak
+*.key
+*.token
+*.env
+.env.*
+config.json
+theme.json
+
