@@ -18,5 +18,19 @@
     "category": "Network",
     "defaultSection": "right",
     "allowMultiple": false
+  },
+  "settings": {
+    "endpoint": {
+      "type": "string",
+      "default": "",
+      "label": "Server Endpoint",
+      "description": "Optional WireGuard server endpoint (host:port) to display in the details panel"
+    },
+    "pingTarget": {
+      "type": "string",
+      "default": "",
+      "label": "Ping Target",
+      "description": "Target IP address or hostname to ping through the VPN interface (defaults to subnet gateway e.g. 10.100.0.1)"
+    }
   }
 }

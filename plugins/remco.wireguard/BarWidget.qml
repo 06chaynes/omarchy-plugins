@@ -183,7 +183,7 @@ BarWidget {
 
   Process {
     id: detailsProc
-    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/remco.wireguard/scripts/wireguard-details"]
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/remco.wireguard/scripts/wireguard-details", String(root.setting("endpoint", ""))]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -209,7 +209,7 @@ BarWidget {
 
   Process {
     id: pingProc
-    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/remco.wireguard/scripts/wireguard-ping"]
+    command: [Quickshell.env("HOME") + "/.config/omarchy/plugins/remco.wireguard/scripts/wireguard-ping", String(root.setting("pingTarget", ""))]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -395,7 +395,7 @@ BarWidget {
 
           Text {
             width: parent.width
-            text: !root.hasProfile ? "GEEN PROFIEL" : (root.connected ? "CONNECTED" : "NOT CONNECTED")
+            text: !root.hasProfile ? "NO PROFILE" : (root.connected ? "CONNECTED" : "NOT CONNECTED")
             color: Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -468,7 +468,7 @@ BarWidget {
 
         Text {
           width: parent.width
-          text: "Kies een WireGuard .conf-bestand om te importeren:"
+          text: "Choose a WireGuard .conf file to import:"
           color: root.bar.foreground
           opacity: 0.8
           font.family: root.bar.fontFamily
@@ -482,7 +482,7 @@ BarWidget {
           spacing: Style.space(8)
 
           Button {
-            text: ".. (boven)"
+            text: ".. (Up)"
             fontSize: Style.font.bodySmall
             foreground: root.bar.foreground
             enabled: root.browseParent !== ""
@@ -532,7 +532,7 @@ BarWidget {
         Text {
           visible: root.browseEntries.length === 0
           width: parent.width
-          text: "Geen mappen of .conf-bestanden gevonden."
+          text: "No folders or .conf files found."
           color: root.bar.foreground
           opacity: 0.5
           font.family: root.bar.fontFamily
@@ -543,7 +543,7 @@ BarWidget {
         Text {
           visible: root.importing
           width: parent.width
-          text: "Bezig met importeren..."
+          text: "Importing..."
           color: root.bar.foreground
           opacity: 0.7
           font.family: root.bar.fontFamily

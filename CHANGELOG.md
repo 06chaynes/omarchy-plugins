@@ -45,3 +45,6 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 
 - Removed `statusSlot` constraint and set icon size to 16px (`Style.space(16)`).
 - Matched active status highlight to `Color.accent` and idle state to theme foreground.
+- Fixed ping measurement logic to auto-detect subnet gateway or accept configurable `pingTarget`.
+- Added configurable `endpoint` and `pingTarget` settings schema to `manifest.json`.
+- Translated Dutch strings to English in the details panel and status script.
