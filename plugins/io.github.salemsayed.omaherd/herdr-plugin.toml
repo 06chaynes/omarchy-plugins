@@ -1,0 +1,22 @@
+# Omaherd's half inside HerdR: a hook that tells the Omarchy bar the moment
+# an agent changes state, so the bar does not have to wait for its next poll.
+# Linked automatically by the bar widget (setting "Instant updates"), or by
+# hand with `herdr plugin link <this directory>`.
+id = "io.github.salemsayed.omaherd"
+name = "Omaherd"
+version = "0.6.2"
+min_herdr_version = "0.7.0"
+description = "Tells the Omarchy bar the moment an agent changes state."
+platforms = ["linux"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["./omaherd-hook"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["./omaherd-hook"]
+
+[[events]]
+on = "pane.closed"
+command = ["./omaherd-hook"]

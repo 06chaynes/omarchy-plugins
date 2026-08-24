@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.ilkaydnc.omargb",
+  "name": "OmaRGB",
+  "version": "0.2.1",
+  "author": "Ilkay Dinc",
+  "license": "MIT",
+  "description": "RGB lighting from the Omarchy bar, following your theme. Every device OpenRGB sees, with mode, color, brightness and speed; stealth mode; changes made elsewhere mirrored.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaRGB",
+    "description": "Your RGB hardware on the theme accent, plus per-device mode, color, brightness, speed and power, and a stealth switch. Through OpenRGB.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "themeSync": false,
+      "autoStartServer": true,
+      "host": "127.0.0.1",
+      "port": 6742,
+      "vividAccent": true
+    },
+    "schema": [
+      {
+        "key": "themeSync",
+        "type": "boolean",
+        "label": "Follow the theme accent",
+        "description": "Push the active theme's accent color to every device whenever the theme changes.",
+        "defaultValue": false
+      },
+      {
+        "key": "vividAccent",
+        "type": "boolean",
+        "label": "Vivid accent on devices",
+        "description": "LEDs render muted colors as white, so the accent is pushed with lifted saturation. Turn off to send the exact accent.",
+        "defaultValue": true
+      },
+      {
+        "key": "autoStartServer",
+        "type": "boolean",
+        "label": "Start the OpenRGB server when none is running",
+        "description": "Launches `openrgb --server` once per session if nothing answers on the SDK port.",
+        "defaultValue": true
+      },
+      {
+        "key": "host",
+        "type": "string",
+        "label": "OpenRGB SDK host",
+        "defaultValue": "127.0.0.1"
+      },
+      {
+        "key": "port",
+        "type": "integer",
+        "label": "OpenRGB SDK port",
+        "min": 1,
+        "max": 65535,
+        "step": 1,
+        "defaultValue": 6742
+      }
+    ]
+  }
+}

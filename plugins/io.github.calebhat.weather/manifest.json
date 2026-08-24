@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.calebhat.weather",
+  "name": "Detailed Weather",
+  "version": "1.2.0",
+  "author": "calebhat",
+  "license": "MIT",
+  "description": "Replaces the Omarchy weather pill with today's remaining-hour forecast, a ten-day outlook, city peek, and Open radar in the default browser.",
+  "homepage": "https://github.com/calebhat/omarchy-weather",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Detailed Weather",
+    "description": "Hourly remaining-day forecast, ten-day outlook, city peek, and Open radar in the browser.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "unit": "auto",
+      "refreshMinutes": 15,
+      "showHourly": true,
+      "showForecast": true,
+      "showAirQuality": true,
+      "showMetrics": true,
+      "showSun": true,
+      "showFeelsLike": true,
+      "alertsEnabled": false,
+      "alertRadiusKm": 100,
+      "alertMinIntensity": "Heavy",
+      "radarSite": "RainViewer",
+      "radarUrl": "",
+      "timeFormat": "24"
+    },
+    "schema": [
+      {
+        "key": "unit",
+        "type": "enum",
+        "label": "Units",
+        "options": ["auto", "metric", "imperial"],
+        "defaultValue": "auto",
+        "description": "Temperature and wind units. Auto follows your locale and country."
+      },
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh interval (minutes)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "showHourly",
+        "type": "boolean",
+        "label": "Show hourly forecast",
+        "defaultValue": true,
+        "description": "Remaining hours for today."
+      },
+      {
+        "key": "showForecast",
+        "type": "boolean",
+        "label": "Show ten-day forecast",
+        "defaultValue": true
+      },
+      {
+        "key": "showAirQuality",
+        "type": "boolean",
+        "label": "Show air quality",
+        "defaultValue": true
+      },
+      {
+        "key": "showMetrics",
+        "type": "boolean",
+        "label": "Show metrics grid",
+        "defaultValue": true
+      },
+      {
+        "key": "showSun",
+        "type": "boolean",
+        "label": "Show sun times",
+        "defaultValue": true
+      },
+      {
+        "key": "showFeelsLike",
+        "type": "boolean",
+        "label": "Show feels-like",
+        "defaultValue": true
+      },
+      {
+        "key": "alertsEnabled",
+        "type": "boolean",
+        "label": "Storm alerts",
+        "defaultValue": false,
+        "description": "Notify when rain or a storm is forecast to reach you."
+      },
+      {
+        "key": "alertRadiusKm",
+        "type": "integer",
+        "label": "Alert radius (km)",
+        "min": 25,
+        "max": 250,
+        "step": 25,
+        "defaultValue": 100
+      },
+      {
+        "key": "alertMinIntensity",
+        "type": "enum",
+        "label": "Alert threshold",
+        "options": ["Light", "Moderate", "Heavy", "Severe"],
+        "defaultValue": "Heavy"
+      },
+      {
+        "key": "radarSite",
+        "type": "enum",
+        "label": "Radar website",
+        "options": ["RainViewer", "NOAA", "Windy", "Weather Underground", "Custom"],
+        "defaultValue": "RainViewer",
+        "description": "Opened by Open radar in your default browser. The choice is saved."
+      },
+      {
+        "key": "radarUrl",
+        "type": "string",
+        "label": "Custom radar URL",
+        "defaultValue": "",
+        "description": "Used when Radar website is Custom. Must be https. Optional {lat} and {lon} placeholders."
+      },
+      {
+        "key": "timeFormat",
+        "type": "enum",
+        "label": "Time format",
+        "options": ["12", "24"],
+        "defaultValue": "24",
+        "description": "12-hour or 24-hour clocks in this plugin."
+      }
+    ]
+  }
+}

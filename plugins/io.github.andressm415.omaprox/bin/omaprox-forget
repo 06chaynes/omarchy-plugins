@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Forget everything locally cached for one guest's console, so the next
+# connection asks from scratch.
+#
+#   omaprox-forget <vmid> [address]
+#
+# Clears everything the console prompt remembered about this guest: the
+# resolved address under this vmid in ~/.config/omaprox/addresses, the web page
+# under the same vmid in ~/.config/omaprox/webpages (both files are written by
+# bin/omaprox-ssh and bin/omaprox-rdp), and the RDP password saved in the login
+# keyring under whichever address is passed — the caller's live,
+# currently-resolved one, since that is the key those credentials were actually
+# filed under.
+#
+# All of it or none of it. The prompt asks these questions together, so a reset
+# that dropped only some of them would leave you answering a form that is
+# already half filled in with the answers you just asked it to forget.
+#
+# There is deliberately nothing here for SSH beyond the address. An installed
+# SSH key is not a secret held on this machine to forget; it is authorization
+# granted on the remote account, and undoing that means removing the line
+# from that account's ~/.ssh/authorized_keys — on the guest, not here, and not
+# something this plugin reaches for on your behalf.
+
+set -uo pipefail
+
+VMID=${1:-}
+ADDRESS=${2:-}
+
+if [[ -z $VMID ]]; then
+  echo "usage: omaprox-forget <vmid> [address]" >&2
+  exit 2
+fi
+
+# A vmid is a Proxmox integer, and it is matched against the contents of the
+# stores below. Anything else means the caller passed something this script
+# should not be treating as a key.
+if [[ ! $VMID =~ ^[0-9]+$ ]]; then
+  echo "omaprox-forget: refusing a non-numeric vmid" >&2
+  exit 2
+fi
+
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/omaprox
+ADDRESSES_FILE=$CONFIG_DIR/addresses
+WEBPAGES_FILE=$CONFIG_DIR/webpages
+
+# Drop this vmid's line from one of the `vmid = value` stores. Returns 0 only
+# when there was something there, so the caller can report what actually
+# happened rather than what it attempted.
+drop_line() {
+  local file=$1 tmp before after
+  [[ -f $file ]] || return 1
+  # The key is compared as a literal string, the same way bin/omaprox-rdp and
+  # bin/omaprox-ssh read these files — never interpolated into a regex.
+  before=$(wc -l <"$file") || return 1
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  awk -v k="$VMID" '
+    { eq = index($0, "=")
+      if (eq > 0) {
+        key = substr($0, 1, eq - 1)
+        gsub(/^[ \t]+|[ \t]+$/, "", key)
+        if (key == k) next
+      }
+      print }' "$file" >"$tmp" || { rm -f "$tmp"; return 1; }
+  after=$(wc -l <"$tmp")
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  (( after < before ))
+}
+
+forgot_address=0
+drop_line "$ADDRESSES_FILE" && forgot_address=1
+
+forgot_webpage=0
+drop_line "$WEBPAGES_FILE" && forgot_webpage=1
+
+forgot_password=0
+if [[ -n $ADDRESS ]] && command -v secret-tool >/dev/null 2>&1; then
+  # Query first so the result reflects reality: `secret-tool clear` exits 0
+  # whether or not anything was there to clear.
+  if secret-tool lookup service omaprox host "$ADDRESS" >/dev/null 2>&1; then
+    secret-tool clear service omaprox host "$ADDRESS" >/dev/null 2>&1
+    forgot_password=1
+  fi
+  # The pre-rename service name, in case this credential predates it.
+  if secret-tool lookup service proxmarchy host "$ADDRESS" >/dev/null 2>&1; then
+    secret-tool clear service proxmarchy host "$ADDRESS" >/dev/null 2>&1
+    forgot_password=1
+  fi
+fi
+
+if ((forgot_address || forgot_password || forgot_webpage)); then
+  echo "forgot"
+else
+  echo "nothing stored"
+fi

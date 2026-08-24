@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.tuthan.dropdown-terminal",
+  "name": "Dropdown Terminal",
+  "version": "1.3.1",
+  "author": "Hung Vo",
+  "license": "MIT",
+  "description": "Summon the configured default terminal in a floating special workspace",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Dropdown Terminal",
+    "description": "Toggle the default terminal as a dropdown",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "schema": [
+      {
+        "key": "showIcon",
+        "type": "boolean",
+        "label": "Show icon",
+        "description": "Show the dropdown terminal icon in the bar.",
+        "defaultValue": true
+      },
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Bar icon",
+        "description": "Nerd Font glyph or text shown for the terminal button.",
+        "defaultValue": "\uF120"
+      },
+      {
+        "key": "autoHideOnFocusLoss",
+        "type": "boolean",
+        "label": "Auto-hide on focus loss",
+        "description": "Hide the terminal by toggling its animated special workspace when another window receives focus.",
+        "defaultValue": false
+      },
+      {
+        "key": "allowSpecialFallthrough",
+        "type": "boolean",
+        "label": "Allow focus through dropdown",
+        "description": "Let normal windows receive pointer focus while the floating dropdown is open. Adds a managed input.special_fallthrough override to your Hyprland config.",
+        "defaultValue": false
+      },
+      {
+        "key": "autoHideDelayMs",
+        "type": "integer",
+        "label": "Auto-hide delay (milliseconds)",
+        "description": "Wait briefly after focus changes before hiding the terminal.",
+        "min": 0,
+        "max": 2000,
+        "step": 50,
+        "defaultValue": 500
+      },
+      {
+        "key": "widthPercent",
+        "type": "integer",
+        "label": "Terminal width (%)",
+        "description": "Width of the dropdown terminal as a percentage of the focused monitor.",
+        "min": 20,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 90
+      },
+      {
+        "key": "heightPercent",
+        "type": "integer",
+        "label": "Terminal height (%)",
+        "description": "Height of the dropdown terminal as a percentage of the focused monitor.",
+        "min": 20,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 45
+      },
+      {
+        "key": "borderColor",
+        "type": "string",
+        "label": "Border color",
+        "description": "Use theme to follow Omarchy, or a Hyprland color such as rgb(ff8800).",
+        "defaultValue": "theme"
+      }
+    ]
+  }
+}

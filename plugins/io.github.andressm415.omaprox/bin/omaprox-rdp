@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+# Open a remote desktop, asking for an address and credentials once each and
+# remembering both.
+#
+#   omaprox-rdp [--vmid N] <address> <label> [extra xfreerdp args...]
+#
+# Run with no terminal attached (which is how the bar launches it) this is
+# silent when it already knows the address and the credentials: the desktop
+# opens and no terminal ever appears. Only when something is missing, or a
+# saved credential is refused, does it open a terminal to ask — and that
+# terminal closes once the session is up, rather than sitting behind the
+# desktop for the rest of it.
+#
+# `<address>` may be empty when `--vmid` is given, meaning the panel could not
+# resolve a real one and this is being asked for it, once, to remember. The
+# vmid is what the answer is filed under: Proxmox keeps vmids unique across
+# the whole cluster, so it is enough on its own.
+#
+# The prompt asks four things — where to connect, who as, the password, the
+# domain — and ends by offering to remember a web page for the guest, which
+# the panel's web button then opens instead of the Proxmox page for the VM.
+# Every one of them is prefilled and takes Enter for "keep it", including the
+# address: an address the panel resolved is still a guess, and overruling one
+# used to mean editing shell.json by hand.
+#
+# Credentials live in the login keyring via libsecret, never in shell.json and
+# never on the command line: FreeRDP is handed its arguments with /args-from
+# reading a 0600 file, because /proc/<pid>/cmdline is world-readable and a /p:
+# argument would show the password to every process on the machine.
+
+set -uo pipefail
+
+VMID=""
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    # Everything after this is data. The panel emits it, and without it a
+    # positional that merely looks like an option — an address of "--vmid",
+    # say — re-entered this loop and took its value from the argument after
+    # it, which is the guest's name.
+    --) shift; break ;;
+    --vmid)
+      [[ $# -ge 2 ]] || { echo "--vmid needs a value" >&2; exit 2; }
+      VMID=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+# A vmid is a Proxmox integer. Anything else means the argv was not shaped the
+# way this script assumed, and it must never reach the stores below: the key is
+# matched against file contents, and a key carrying metacharacters is a key
+# that can be read as code rather than as a name.
+if [[ -n $VMID && ! $VMID =~ ^[0-9]+$ ]]; then
+  echo "omaprox-rdp: refusing a non-numeric vmid" >&2
+  exit 2
+fi
+
+ADDRESS=${1:-}
+LABEL=${2:-${1:-}}
+shift 2 2>/dev/null || true
+EXTRA_ARGS=("$@")
+
+if [[ -z $ADDRESS && -z $VMID ]]; then
+  echo "usage: omaprox-rdp [--vmid N] <address> <label> [xfreerdp args...]" >&2
+  exit 2
+fi
+
+ADDRESSES_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/omaprox/addresses
+# The guest's own web page, kept beside the addresses in a second file of the
+# same shape rather than as a second column in the first one. Two files of
+# `vmid = value` need no format, no parser and no migration; one file of
+# `vmid = address, url` needs all three the moment a URL contains a comma.
+WEBPAGES_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/omaprox/webpages
+
+# `vmid = value`, one per line — the same store bin/omaprox-ssh writes to and
+# the same `key = value` shape as the token file.
+# The key is compared as a literal string, never interpolated into a regex or
+# a sed script. `awk -v` hands it over as data, so a key is only ever a name.
+lookup_in() {
+  [[ -n $VMID && -f $1 ]] || return 1
+  local v
+  v=$(awk -v k="$VMID" '
+        { eq = index($0, "=")
+          if (eq == 0) next
+          key = substr($0, 1, eq - 1); val = substr($0, eq + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", key)
+          sub(/^[ \t]+/, "", val)
+          if (key == k) out = val }
+        END { if (out != "") print out }' "$1")
+  [[ -n $v ]] || return 1
+  printf '%s' "$v"
+}
+
+# An empty value removes the line rather than writing a blank one, so "clear
+# this" and "never set this" leave the file in the same state.
+store_in() {
+  [[ -n $VMID ]] || return 0
+  # One entry is one line. A value carrying a newline would write a second
+  # line and so forge an entry for a vmid nobody touched — which is how a
+  # hostile guest name could pin another guest's console to a host of its
+  # choosing.
+  case $2 in
+    *$'\n'* | *$'\r'*)
+      echo "omaprox-rdp: refusing to store a multi-line value" >&2
+      return 1 ;;
+  esac
+  mkdir -p "$(dirname "$1")"
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  { [[ -f $1 ]] && awk -v k="$VMID" '
+        { eq = index($0, "=")
+          if (eq > 0) {
+            key = substr($0, 1, eq - 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == k) next
+          }
+          print }' "$1"
+    [[ -n $2 ]] && printf '%s = %s\n' "$VMID" "$2"; } >"$tmp"
+  mv "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+}
+
+lookup_address() { lookup_in "$ADDRESSES_FILE"; }
+store_address()  { store_in "$ADDRESSES_FILE" "$1"; }
+lookup_webpage() { lookup_in "$WEBPAGES_FILE"; }
+store_webpage()  { store_in "$WEBPAGES_FILE" "$1"; }
+
+# Fill in from the store before anything else runs, so a vmid that has already
+# been resolved once behaves exactly like an address the panel knew outright —
+# including staying silent through the no-terminal path below.
+if [[ -z $ADDRESS && -n $VMID ]]; then
+  ADDRESS=$(lookup_address) || ADDRESS=""
+fi
+
+command -v xfreerdp3 >/dev/null 2>&1 || {
+  echo "xfreerdp3 is not installed. Install the 'freerdp' package." >&2
+  exit 127
+}
+
+HAVE_KEYRING=0
+command -v secret-tool >/dev/null 2>&1 && HAVE_KEYRING=1
+
+SCHEMA=()
+LEGACY_SCHEMA=()
+
+# The keyring key names the address, and the address can now be resolved after
+# this script has already started — the terminal-mode prompt below fills in
+# an ADDRESS that was empty when the script was invoked. SCHEMA cannot be a
+# plain assignment made once near the top the way it used to be: computed
+# before that prompt runs, it would freeze in the empty string, and every
+# credential lookup and save for the rest of the run would silently miss.
+# Called once, right after ADDRESS is settled for good, in every path that
+# reaches the functions below.
+#
+# The plugin was first published as "proxmarchy", so a credential saved before
+# the rename lives under that service name. Look both up; anything found in the
+# old one is migrated over on success so the rename never orphans it.
+set_schema() {
+  SCHEMA=(service omaprox host "$ADDRESS")
+  LEGACY_SCHEMA=(service proxmarchy host "$ADDRESS")
+}
+
+# `secret-tool search` splits its output: label and secret to stdout, the
+# attributes to stderr. Discarding stderr loses the very fields being read;
+# discarding stdout is what we want, since it keeps the password out of the pipe.
+attribute() {
+  ((HAVE_KEYRING)) || return 1
+  local v
+  v=$(secret-tool search "${SCHEMA[@]}" 2>&1 >/dev/null |
+    sed -n "s/^ *attribute\.$1 = //p" | head -1)
+  if [[ -n $v ]]; then printf '%s' "$v"; return 0; fi
+  v=$(secret-tool search "${LEGACY_SCHEMA[@]}" 2>&1 >/dev/null |
+    sed -n "s/^ *attribute\.$1 = //p" | head -1)
+  [[ -n $v ]] && printf '%s' "$v"
+  [[ -n $v ]]
+}
+
+lookup_password() {
+  ((HAVE_KEYRING)) || return 1
+  local p
+  p=$(secret-tool lookup "${SCHEMA[@]}" 2>/dev/null)
+  [[ -n $p ]] || p=$(secret-tool lookup "${LEGACY_SCHEMA[@]}" 2>/dev/null)
+  [[ -n $p ]] || return 1
+  printf '%s' "$p"
+}
+
+forget() {
+  ((HAVE_KEYRING)) || return 0
+  secret-tool clear "${SCHEMA[@]}" 2>/dev/null
+  secret-tool clear "${LEGACY_SCHEMA[@]}" 2>/dev/null
+  return 0
+}
+
+remember() {
+  ((HAVE_KEYRING)) || return 0
+  if printf '%s' "$3" | secret-tool store --label="Omaprox — $LABEL" \
+      "${SCHEMA[@]}" username "$1" domain "$2" 2>/dev/null; then
+    # One canonical copy under the current name; drop the pre-rename one if it
+    # is still there.
+    secret-tool clear "${LEGACY_SCHEMA[@]}" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
+# One argument per line, to be piped into /args-from:stdin.
+emit_args() {
+  printf '/v:%s\n' "$ADDRESS"
+  printf '/u:%s\n' "$1"
+  printf '/p:%s\n' "$2"
+  [[ -n $3 ]] && printf '/d:%s\n' "$3"
+  # Proxmox self-signs, and a workgroup Windows box signs its own RDP
+  # certificate too, so verification would refuse every connection.
+  printf '/cert:ignore\n'
+  # NTLM only. Without this FreeRDP tries Kerberos first and, on a machine with
+  # a stock /etc/krb5.conf whose default_realm is ATHENA.MIT.EDU, spends several
+  # seconds failing against MIT's realm and fills the screen with errors that
+  # have nothing to do with the login being attempted.
+  printf '/auth-pkg-list:none,ntlm\n'
+  printf '/dynamic-resolution\n+clipboard\n'
+  local arg
+  for arg in ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"}; do
+    [[ -n $arg ]] && printf '%s\n' "$arg"
+  done
+}
+
+# Is the RDP port actually open? Answering this ourselves is what lets the watch
+# below ask only one question — were the credentials refused. Inferring
+# reachability from FreeRDP's log instead means enumerating everything a
+# *successful* run can print, and getting that list wrong reports correct
+# passwords as an unreachable host.
+reachable() {
+  local host=$ADDRESS port=3389
+  case $ADDRESS in
+    \[*\]:*) host=${ADDRESS%]:*}; host=${host#[}; port=${ADDRESS##*]:} ;;
+    \[*\])   host=${ADDRESS#[}; host=${host%]} ;;
+    *:*)     host=${ADDRESS%:*}; port=${ADDRESS##*:} ;;
+  esac
+  # The address is handed over as data (argv), never interpolated into the
+  # command text: an address is a string that came from the cluster, and a
+  # string that becomes shell code is a command execution bug.
+  timeout 6 bash -c 'exec 3<>"$1"' _ "/dev/tcp/$host/$port" 2>/dev/null
+}
+
+REFUSED_RE="ERRCONNECT_(LOGON_FAILURE|ACCOUNT_[A-Z_]+|PASSWORD_[A-Z_]+|ACCESS_DENIED|AUTHENTICATION_FAILED)"
+
+# Start the real session and watch it just long enough to tell whether the login
+# was accepted. 0 = connected, 1 = refused, 2 = could not reach the host.
+#
+# There is deliberately no separate +auth-only probe. Authenticating, dropping
+# the connection and immediately reconnecting makes Windows spend a minute or
+# more letting the second one in — the desktop appears as a black window and
+# hangs there. Connecting once and reading the outcome as it happens costs
+# nothing and keeps the session instant.
+#
+# A rejection lands within a second or two, so a connection still healthy after
+# the watch window is a connection that authenticated.
+launch_watched() {
+  reachable || return 2
+
+  local tmpbase=${XDG_RUNTIME_DIR:-/tmp}
+  local log args_file waited=0
+  log=$(mktemp "$tmpbase/omaprox-rdp.log.XXXXXX") || return 2
+  args_file=$(mktemp "$tmpbase/omaprox-rdp.args.XXXXXX") || { rm -f "$log"; return 2; }
+
+  # The args — password included — never touch a process command line. They are
+  # written to a 0600 file by the shell builtin (no child process, so nothing
+  # shows up in /proc/<pid>/cmdline), FreeRDP reads them back from that file
+  # through /args-from:stdin, and the name is unlinked the moment the descriptor
+  # is open, so the secret spends as little time on disk as it takes FreeRDP to
+  # consume it.
+  emit_args "$1" "$2" "$3" >"$args_file"
+
+  # setsid so the session survives this script and the terminal that ran it.
+  setsid bash -c 'exec 0<"$1"; rm -f "$1"; xfreerdp3 /args-from:stdin >"$2" 2>&1' \
+    _ "$args_file" "$log" &
+
+  while ((waited < 24)); do
+    if grep -qE "$REFUSED_RE" "$log" 2>/dev/null; then
+      rm -f "$log" "$args_file"
+      return 1
+    fi
+    sleep 0.25
+    ((waited++))
+  done
+
+  # The log is dropped, not read further: the session owns the descriptor and
+  # keeps writing to it for as long as it runs.
+  rm -f "$log" "$args_file"
+  return 0
+}
+
+# Every question is prefilled with the current answer and takes Enter for
+# "keep it", so correcting one of them never means retyping the rest.
+#
+# The address is asked here rather than only when it is missing. An address the
+# panel resolved is still a guess — the guest agent reports whichever interface
+# it feels like, and a VM with a docker bridge routinely offers 172.17.0.1 —
+# and before this, the only way to overrule one was to go and edit shell.json.
+ask() {
+  local default_user=$1 default_domain=$2 previous=$ADDRESS reply
+
+  echo
+  echo "  $LABEL${ADDRESS:+  ·  $ADDRESS}"
+  echo
+
+  if [[ -n $ADDRESS ]]; then
+    read -rp "  Address [$ADDRESS]: " reply
+  else
+    echo "  No known address for $LABEL${VMID:+ (vmid $VMID)}."
+    echo "  Asked once, then remembered in $ADDRESSES_FILE."
+    echo
+    read -rp "  Address or hostname: " reply
+  fi
+  reply=${reply// /}
+  if [[ -n $reply ]]; then ADDRESS=$reply; fi
+  if [[ -z $ADDRESS ]]; then
+    echo "  No address entered — nothing to connect to." >&2
+    exit 2
+  fi
+  if [[ $ADDRESS != "$previous" ]]; then
+    store_address "$ADDRESS"
+    # The keyring entry is filed under the address, so the credentials just
+    # offered belong to the machine we are no longer connecting to. Re-key
+    # first, then re-read: whatever is saved against the *new* address is what
+    # should be prefilled below.
+    set_schema
+    default_user=$(attribute username) || default_user=""
+    default_domain=$(attribute domain) || default_domain=""
+  fi
+
+  if [[ -n $default_user ]]; then
+    read -rp "  Username [$default_user]: " USERNAME
+    USERNAME=${USERNAME:-$default_user}
+  else
+    read -rp "  Username: " USERNAME
+  fi
+  read -rsp "  Password: " PASSWORD
+  echo
+  # A local Windows account has no domain, which is the common case for a
+  # workgroup PC, so blank is offered as the answer rather than demanded.
+  read -rp "  Domain (blank for a local account) [${default_domain:-none}]: " DOMAIN
+  DOMAIN=${DOMAIN:-$default_domain}
+
+  # Last, because it is the one question that is not about connecting. A guest
+  # with a page of its own — a NAS, a router, anything with a web console —
+  # gets that page on the panel's web button instead of the Proxmox one.
+  #
+  # Saved as soon as it is answered rather than after a successful connect: it
+  # has nothing to do with whether the login worked, and losing it to a typo in
+  # the password would be a small, baffling thing to have to redo.
+  if [[ -n $VMID ]]; then
+    if [[ -n $WEBPAGE ]]; then
+      read -rp "  Web page [$WEBPAGE]  (- for none): " reply
+    else
+      read -rp "  Web page (blank for the Proxmox page): " reply
+    fi
+    reply=${reply// /}
+    if [[ $reply == "-" ]]; then
+      WEBPAGE=""
+      store_webpage "-"
+    elif [[ -n $reply ]]; then
+      WEBPAGE=$reply
+      store_webpage "$WEBPAGE"
+    fi
+  fi
+  echo
+}
+
+# ---------------------------------------------------------------- no terminal
+
+# Launched from the bar: stdin is not a tty. Succeed silently if possible,
+# otherwise re-launch inside a terminal that can ask — for the address, for
+# credentials, or both, whichever this run is still missing.
+if [[ ! -t 0 ]]; then
+  if [[ -n $ADDRESS ]]; then
+    set_schema
+    PASSWORD=$(lookup_password) || PASSWORD=""
+    if [[ -n $PASSWORD ]]; then
+      USERNAME=$(attribute username) || USERNAME=""
+      DOMAIN=$(attribute domain) || DOMAIN=""
+      launch_watched "$USERNAME" "$PASSWORD" "$DOMAIN"
+      case $? in
+        0) remember "$USERNAME" "$DOMAIN" "$PASSWORD"; exit 0 ;; # connected, migrate any legacy entry
+        2) ;;                 # host down — fall through so the terminal says so
+        *) forget ;;          # refused — stop trying them and ask again
+      esac
+    fi
+  fi
+
+  vmid_args=()
+  [[ -n $VMID ]] && vmid_args=(--vmid "$VMID")
+  quoted=$(printf '%q ' "$0" ${vmid_args[@]+"${vmid_args[@]}"} "$ADDRESS" "$LABEL" \
+    ${EXTRA_ARGS+"${EXTRA_ARGS[@]}"})
+  exec setsid uwsm-app -- xdg-terminal-exec \
+    --app-id=org.omarchy.terminal \
+    --title="$LABEL  ·  sign in" \
+    -e bash -c "$quoted"
+fi
+
+# ---------------------------------------------------------------- terminal
+
+# The address is question one in ask() now, prefilled with whatever is known,
+# so there is no separate block for the case where nothing is — ask() prints
+# the explanation when it has no default to offer.
+set_schema
+
+((HAVE_KEYRING)) || echo "  secret-tool not found — credentials cannot be saved."
+
+USERNAME=$(attribute username) || USERNAME=""
+DOMAIN=$(attribute domain) || DOMAIN=""
+PASSWORD=""
+WEBPAGE=$(lookup_webpage) || WEBPAGE=""
+# "-" is the stored marker for "asked, declined" that keeps bin/omaprox-ssh
+# from asking again; as a prefill it is not an answer, it is the absence of one.
+[[ $WEBPAGE == "-" ]] && WEBPAGE=""
+
+for attempt in 1 2 3; do
+  ask "$USERNAME" "$DOMAIN"
+  printf '  Connecting… '
+  launch_watched "$USERNAME" "$PASSWORD" "$DOMAIN"
+  case $? in
+    0)
+      echo "connected"
+      remember "$USERNAME" "$DOMAIN" "$PASSWORD" \
+        && echo "  Saved to the login keyring — you will not be asked again." \
+        || echo "  Could not save to the keyring."
+      [[ -n $WEBPAGE ]] && echo "  Web button for $LABEL opens $WEBPAGE."
+      exit 0
+      ;;
+    2)
+      echo "cannot reach $ADDRESS"
+      # Not fatal any more. The address is the first thing ask() offers, so the
+      # obvious response to "cannot reach" — try a different one — is now a
+      # loop rather than a closed window and a second trip through the panel.
+      if [[ $attempt -lt 3 ]]; then
+        echo "  Wrong address? Enter another one, or Ctrl-C to give up."
+      else
+        echo
+        if [[ -n $VMID ]]; then
+          echo "  Still unreachable. To pin one by hand instead, put it in"
+          echo "  ~/.config/omarchy/shell.json:"
+          echo '    { "id": "io.github.andressm415.omaprox", "addresses": { "'"$VMID"'": "<ip>" } }'
+          echo
+        fi
+        read -rp "  press enter to close "
+        exit 1
+      fi
+      ;;
+    *)
+      echo "rejected"
+      [[ $attempt -lt 3 ]] && echo "  Wrong username or password — try again."
+      ;;
+  esac
+done
+
+echo
+echo "  Giving up after 3 attempts."
+read -rp "  press enter to close "
+exit 1

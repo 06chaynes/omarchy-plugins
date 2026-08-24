@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""Bring a HerdR agent to the front, or attach to it in a terminal.
+
+Local agents: raise the window already showing the session and switch it to
+the pane; otherwise attach in a new terminal.
+Remote agents: focus the pane on the remote server over SSH and raise the
+local window that is showing that server (``herdr --remote``, ssh, or mosh);
+otherwise attach over ``ssh -t`` in a new terminal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from omaherd_io import ensure_private_directory, private_runtime_directory, run_capped
+
+
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9._~-]+$")
+SSH_HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+TARGET_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+REMOTE_PATH = (
+    '"$HOME/.local/bin:$HOME/bin:$HOME/.local/share/mise/shims:'
+    '$HOME/.nix-profile/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:'
+    '/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:$PATH"'
+)
+# Programs that carry a remote terminal into a local window. A window whose
+# process tree holds one of these and whose title is HerdR's "host: workspace"
+# is showing the remote session we are after.
+REMOTE_CARRIERS = {"ssh", "mosh", "mosh-client", "et", "autossh"}
+HERDR_OPTIONS_WITH_VALUES = {"--session", "--remote", "--remote-keybindings"}
+HERDR_NONCLIENT_FLAGS = {"--no-session", "--default-config", "--skill", "--version", "-V", "--help", "-h"}
+MAX_CONTROL_STDOUT_BYTES = 512 * 1024
+MAX_CONTROL_STDERR_BYTES = 32 * 1024
+MAX_PEEK_STDOUT_BYTES = 64 * 1024
+MAX_PEEK_STDERR_BYTES = 16 * 1024
+
+
+def valid_remote_target(value: str) -> bool:
+    if "://" not in value:
+        if value.count("@") > 1:
+            return False
+        user, separator, host = value.rpartition("@")
+        if not separator:
+            user = ""
+        return bool(SSH_HOST_RE.fullmatch(host)) and (
+            not separator or bool(SSH_USER_RE.fullmatch(user))
+        )
+    if not value.startswith("ssh://") or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    hostname = parsed.hostname or ""
+    valid_host = ":" in hostname or bool(SSH_HOST_RE.fullmatch(hostname))
+    return (
+        parsed.scheme == "ssh"
+        and valid_host
+        and parsed.password is None
+        and (parsed.username is None or bool(SSH_USER_RE.fullmatch(parsed.username)))
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+        and (port is None or 1 <= port <= 65535)
+    )
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="local")
+    parser.add_argument("--session", default="default")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--workspace", default="", help="Workspace label, used to recognise a remote window by title")
+    parser.add_argument("--hostname", default="", help="The remote machine's own hostname, as it titles its windows")
+    parser.add_argument("--timeout", type=int, default=3, help="SSH connection timeout in seconds")
+    parser.add_argument(
+        "--focus",
+        action="store_true",
+        help="Raise an open window for the session and focus the target in it; "
+        "attach in a new terminal only when no window is open",
+    )
+    parser.add_argument("--peek", action="store_true",
+                        help="Print the agent's recent terminal lines and exit (opt-in in the panel)")
+    parser.add_argument("--lines", type=int, default=12, help="How many lines --peek prints")
+    parser.add_argument("--reply", default=None,
+                        help="Type this text into the agent's pane and press Enter")
+    return parser.parse_args()
+
+
+def validate(host: str, session: str, target: str, required: bool = False) -> None:
+    if host != "local" and not valid_remote_target(host):
+        raise SystemExit("Invalid SSH target")
+    if not SESSION_RE.fullmatch(session):
+        raise SystemExit("Invalid HerdR session name")
+    if required and not target:
+        raise SystemExit("Invalid HerdR agent target")
+    if target and not TARGET_RE.fullmatch(target):
+        raise SystemExit("Invalid HerdR agent target")
+
+
+def remote_shell(arguments: list[str]) -> str:
+    script = f"PATH={REMOTE_PATH}; export PATH; exec {shlex.join(arguments)}"
+    return f"exec /bin/sh -lc {shlex.quote(script)}"
+
+
+def build_command(host: str, session: str, target: str = "") -> list[str]:
+    """The interactive command a terminal runs to attach."""
+    validate(host, session, target)
+    herdr = ["herdr", "--session", session]
+    if target:
+        herdr.extend(["agent", "attach", target])
+    if host == "local":
+        return herdr
+    return ["ssh", "-t", "--", host, remote_shell(herdr)]
+
+
+def remote_wrap(host: str, herdr: list[str], timeout: int) -> list[str]:
+    return ["ssh", *ssh_options(max(1, timeout)), "--", host, remote_shell(herdr)]
+
+
+def peek_command(host: str, session: str, target: str, lines: int = 12, timeout: int = 3) -> list[str]:
+    """The recent lines of the agent's terminal, plain text. Read-only, and
+    only ever run because a person pressed P with the setting on."""
+    validate(host, session, target, required=True)
+    count = max(1, min(200, int(lines or 12)))
+    herdr = ["herdr", "--session", session, "agent", "read", target,
+             "--lines", str(count), "--format", "text", "--source", "recent"]
+    return herdr if host == "local" else remote_wrap(host, herdr, timeout)
+
+
+def reply_commands(host: str, session: str, target: str, text: str, timeout: int = 3) -> list[list[str]]:
+    """Type a reply into the pane, then Enter. Pane-level rather than
+    `agent prompt`, which refuses agents sitting at an approval dialog — the
+    exact moment a reply is wanted."""
+    validate(host, session, target, required=True)
+    body = str(text or "").replace("\r", "").replace("\n", " ").strip()
+    if body == "":
+        raise SystemExit("Nothing to send")
+    if len(body) > 2000:
+        raise SystemExit("Reply is too long")
+    commands = [
+        ["herdr", "--session", session, "pane", "send-text", target, body],
+        ["herdr", "--session", session, "pane", "send-keys", target, "enter"],
+    ]
+    if host == "local":
+        return commands
+    return [remote_wrap(host, command, timeout) for command in commands]
+
+
+def focus_command(host: str, session: str, target: str, timeout: int = 3) -> list[str]:
+    """The non-interactive command that switches the server to the pane."""
+    validate(host, session, target, required=True)
+    herdr = ["herdr", "--session", session, "agent", "focus", target]
+    if host == "local":
+        return herdr
+    return ["ssh", *ssh_options(max(1, timeout)), "--", host, remote_shell(herdr)]
+
+
+def control_dir() -> Path | None:
+    return private_runtime_directory()
+
+
+def ssh_options(timeout: int, control: Path | None = None) -> list[str]:
+    """The same noninteractive, connection-sharing options the status helper
+    uses, so a focus rides the master the monitor already holds open."""
+    options = ["-o", "BatchMode=yes", "-o", f"ConnectTimeout={timeout}"]
+    path = control if control is not None else control_dir()
+    if path is None:
+        return options
+    try:
+        if control is not None and not ensure_private_directory(path):
+            return options
+    except OSError:
+        return options
+    return options + [
+        "-o", "ControlMaster=auto",
+        "-o", f"ControlPath={path}/ssh-%C",
+        "-o", "ControlPersist=60",
+    ]
+
+
+# --------------------------------------------------------------- processes
+
+def read_cmdline(proc_entry: Path) -> list[str]:
+    try:
+        raw = (proc_entry / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def parent_pid(proc_entry: Path) -> int:
+    try:
+        for line in (proc_entry / "status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def process_table(proc: Path = Path("/proc")) -> dict[int, tuple[int, list[str]]]:
+    """pid -> (ppid, cmdline) for every process we can read."""
+    table: dict[int, tuple[int, list[str]]] = {}
+    try:
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            cmdline = read_cmdline(entry)
+            if cmdline:
+                table[int(entry.name)] = (parent_pid(entry), cmdline)
+    except OSError:
+        pass
+    return table
+
+
+def option_value(cmdline: list[str], option: str, default: str = "") -> str:
+    for index, part in enumerate(cmdline[1:], start=1):
+        if part == option and index + 1 < len(cmdline):
+            return cmdline[index + 1]
+        if part.startswith(option + "="):
+            return part.split("=", 1)[1]
+    return default
+
+
+def is_herdr_client(cmdline: list[str]) -> bool:
+    if not cmdline or Path(cmdline[0]).name != "herdr":
+        return False
+    if any(flag in HERDR_NONCLIENT_FLAGS for flag in cmdline[1:]):
+        return False
+    skip_value = False
+    for part in cmdline[1:]:
+        if skip_value:
+            skip_value = False
+            continue
+        if part in HERDR_OPTIONS_WITH_VALUES:
+            skip_value = True
+            continue
+        if any(part.startswith(option + "=") for option in HERDR_OPTIONS_WITH_VALUES):
+            continue
+        if part.startswith("-"):
+            continue
+        return False
+    return True
+
+
+def herdr_client_pids(session: str, table: dict[int, tuple[int, list[str]]], host: str = "local") -> list[int]:
+    """Interactive HerdR clients showing `session` on `host`, by pid."""
+    pids: list[int] = []
+    for pid, (_, cmdline) in table.items():
+        if not is_herdr_client(cmdline):
+            continue
+        remote = option_value(cmdline, "--remote")
+        if host == "local":
+            if remote:
+                continue
+        elif remote != host:
+            continue
+        if option_value(cmdline, "--session", "default") == session:
+            pids.append(pid)
+    return sorted(pids)
+
+
+def ancestors(pid: int, table: dict[int, tuple[int, list[str]]]) -> list[int]:
+    chain: list[int] = []
+    current = pid
+    while current > 1 and len(chain) < 32 and current in table:
+        chain.append(current)
+        current = table[current][0]
+    return chain
+
+
+def descendants(pid: int, table: dict[int, tuple[int, list[str]]]) -> list[int]:
+    children: dict[int, list[int]] = {}
+    for child, (ppid, _) in table.items():
+        children.setdefault(ppid, []).append(child)
+    found: list[int] = []
+    stack = [pid]
+    while stack and len(found) < 512:
+        current = stack.pop()
+        for child in children.get(current, []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
+def windows_for_pids(
+    pids: list[int], windows: list[dict], table: dict[int, tuple[int, list[str]]],
+) -> list[dict]:
+    """Toplevels whose process trees hold one of the given processes."""
+    by_pid: dict[int, dict] = {}
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        try:
+            pid = int(window.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_pid[pid] = window
+    found: list[dict] = []
+    seen: set[str] = set()
+    for pid in pids:
+        for ancestor in ancestors(pid, table):
+            if ancestor in by_pid:
+                window = by_pid[ancestor]
+                identity = str(window.get("address") or ancestor)
+                if identity not in seen:
+                    found.append(window)
+                    seen.add(identity)
+                break
+    return found
+
+
+def window_for_pids(pids: list[int], windows: list[dict], table: dict[int, tuple[int, list[str]]]) -> dict | None:
+    """The first toplevel whose process tree holds one of the given processes."""
+    found = windows_for_pids(pids, windows, table)
+    return found[0] if found else None
+
+
+def window_for_local(
+    session: str, workspace: str, hostname: str,
+    windows: list[dict], table: dict[int, tuple[int, list[str]]],
+) -> dict | None:
+    """The local HerdR client that is showing the target workspace.
+
+    One client is unambiguous and can be switched after it is raised. With
+    multiple clients, their HerdR-managed window titles keep us from raising
+    whichever client happened to have the oldest pid.
+    """
+    clients = windows_for_pids(herdr_client_pids(session, table), windows, table)
+    if len(clients) <= 1:
+        return clients[0] if clients else None
+    if not workspace:
+        return None
+    candidates = remote_title_hosts(hostname)
+    exact = [window for window in clients
+             if remote_title_matches(window.get("title"), workspace, candidates)]
+    if exact:
+        return exact[0]
+    suffix_only = [window for window in clients
+                   if remote_title_matches(window.get("title"), workspace, None)]
+    return suffix_only[0] if len(suffix_only) == 1 else None
+
+
+def window_for_remote(
+    host: str, session: str, workspace: str,
+    windows: list[dict], table: dict[int, tuple[int, list[str]]],
+    title_hosts: set[str] | None = None,
+) -> dict | None:
+    """A local window showing the remote session.
+
+    Prefers a ``herdr --remote <host>`` client. Failing that, HerdR titles its
+    terminal "<hostname>: <workspace>", so a window carrying an ssh or mosh
+    session whose title ends in the workspace we want is showing it.
+    """
+    candidates = title_hosts if title_hosts is not None else remote_title_hosts(host)
+    managed_clients = windows_for_pids(
+        herdr_client_pids(session, table, host), windows, table,
+    )
+    if len(managed_clients) == 1:
+        return managed_clients[0]
+    if managed_clients and workspace:
+        exact = [window for window in managed_clients
+                 if remote_title_matches(window.get("title"), workspace, candidates)]
+        if exact:
+            return exact[0]
+        suffix_only = [window for window in managed_clients
+                       if remote_title_matches(window.get("title"), workspace, None)]
+        if len(suffix_only) == 1:
+            return suffix_only[0]
+    if not workspace:
+        return None
+    by_pid: dict[int, dict] = {}
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        try:
+            pid = int(window.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_pid[pid] = window
+
+    # Walk up from carrier processes instead of rebuilding every window's
+    # descendant table. This is linear in /proc and also avoids accepting an
+    # unrelated SSH window merely because it has the same workspace suffix.
+    carrier_windows: set[int] = set()
+    for pid, (_, cmdline) in table.items():
+        if not cmdline or Path(cmdline[0]).name not in REMOTE_CARRIERS:
+            continue
+        for ancestor in ancestors(pid, table):
+            if ancestor in by_pid:
+                carrier_windows.add(ancestor)
+                break
+    # A title naming the host we asked for wins outright. Failing that, the
+    # remote's own hostname often differs from the alias — and an alias that
+    # resolves to a bare IP gives us nothing to compare — so one lone carrier
+    # window ending in this workspace is still the right answer. Two or more
+    # is a real ambiguity, and opening a terminal beats raising the wrong one.
+    suffix_only: list[dict] = []
+    for pid, window in by_pid.items():
+        if pid not in carrier_windows:
+            continue
+        title = window.get("title")
+        if remote_title_matches(title, workspace, candidates):
+            return window
+        if remote_title_matches(title, workspace, None):
+            suffix_only.append(window)
+    return suffix_only[0] if len(suffix_only) == 1 else None
+
+
+def remote_title_hosts(host: str) -> set[str]:
+    value = str(host or "")
+    if value.startswith("ssh://"):
+        try:
+            value = urlsplit(value).hostname or ""
+        except ValueError:
+            return set()
+    else:
+        value = value.rsplit("@", 1)[-1]
+    value = value.strip("[]").lower().rstrip(".")
+    if not value:
+        return set()
+    candidates = {value}
+    if "." in value and not all(part.isdigit() for part in value.split(".")):
+        candidates.add(value.split(".", 1)[0])
+    return candidates
+
+
+def configured_title_hosts(host: str) -> set[str]:
+    """Host labels OpenSSH may turn an alias into, without connecting."""
+    candidates = remote_title_hosts(host)
+    try:
+        result = run_capped(
+            ["ssh", "-G", "--", host], timeout=2,
+            stdout_limit=MAX_CONTROL_STDOUT_BYTES, stderr_limit=MAX_CONTROL_STDERR_BYTES,
+        )
+    except OSError:
+        return candidates
+    if result.returncode != 0:
+        return candidates
+    for line in result.stdout.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) == 2 and fields[0].lower() == "hostname":
+            candidates.update(remote_title_hosts(fields[1]))
+            break
+    return candidates
+
+
+def remote_title_matches(title: object, workspace: str, candidates: set[str] | None) -> bool:
+    """True when the title is HerdR's "<host>: <workspace>" for this workspace;
+    with `candidates` the host label must be one of them too."""
+    value = str(title or "").strip().lower()
+    suffix = f": {workspace}".lower()
+    if not value.endswith(suffix):
+        return False
+    prefix = value[:-len(suffix)].rstrip()
+    if not prefix:
+        return False
+    if candidates is None:
+        return True
+    label = prefix.rsplit(maxsplit=1)[-1]
+    return label.rstrip(".") in candidates
+
+
+# ---------------------------------------------------------------- desktop
+
+def hyprland_windows() -> list[dict]:
+    try:
+        result = run_capped(
+            ["hyprctl", "clients", "-j"], timeout=2,
+            stdout_limit=MAX_CONTROL_STDOUT_BYTES, stderr_limit=MAX_CONTROL_STDERR_BYTES,
+        )
+        parsed = json.loads(result.stdout or "[]")
+    except (OSError, json.JSONDecodeError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def raise_window(window: dict | None) -> bool:
+    if not window or not window.get("address"):
+        return False
+    selector = f"address:{window['address']}"
+    # Hyprland 0.55+ dispatches Lua expressions. Keep the legacy form as a
+    # fallback so Omaherd still works on older Omarchy installations.
+    commands = [
+        ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "{selector}" }})'],
+        ["hyprctl", "dispatch", "focuswindow", selector],
+    ]
+    for command in commands:
+        try:
+            result = run_capped(
+                command, timeout=2,
+                stdout_limit=MAX_CONTROL_STDERR_BYTES, stderr_limit=MAX_CONTROL_STDERR_BYTES,
+            )
+        except OSError:
+            continue
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def wait_for_remote_window(
+    host: str, session: str, workspace: str,
+    table: dict[int, tuple[int, list[str]]], candidates: set[str],
+    attempts: int = 8, delay: float = 0.1,
+) -> dict | None:
+    """Wait briefly for a remote focus to update its carrier window title."""
+    for attempt in range(max(1, attempts)):
+        window = window_for_remote(
+            host, session, workspace, hyprland_windows(), table, candidates,
+        )
+        if window:
+            return window
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, delay))
+    return None
+
+
+def wait_for_local_window(
+    session: str, workspace: str, hostname: str,
+    table: dict[int, tuple[int, list[str]]], attempts: int = 8, delay: float = 0.1,
+) -> dict | None:
+    """Wait briefly for a focused local client's title to identify itself."""
+    for attempt in range(max(1, attempts)):
+        window = window_for_local(
+            session, workspace, hostname, hyprland_windows(), table,
+        )
+        if window:
+            return window
+        if attempt + 1 < attempts:
+            time.sleep(max(0.0, delay))
+    return None
+
+
+def exec_or_error(command: list[str]) -> int:
+    try:
+        os.execvp(command[0], command)
+    except FileNotFoundError:
+        print(f"{command[0]} is not installed", file=sys.stderr)
+        return 127
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        return 126
+    return 127
+
+
+def run_quiet(command: list[str], timeout: float) -> int:
+    try:
+        result = run_capped(
+            command, timeout=timeout,
+            stdout_limit=MAX_CONTROL_STDERR_BYTES, stderr_limit=MAX_CONTROL_STDERR_BYTES,
+        )
+    except FileNotFoundError:
+        print(f"{command[0]} is not installed", file=sys.stderr)
+        return 127
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        return 126
+    if result.returncode != 0:
+        message = str(result.stderr or result.stdout or "").strip()
+        if message:
+            print(message, file=sys.stderr)
+    return result.returncode
+
+
+def main() -> int:
+    args = arguments()
+    timeout = max(1, min(15, args.timeout))
+    if getattr(args, "peek", False):
+        command = peek_command(args.host, args.session, args.target, getattr(args, "lines", 12), timeout)
+        try:
+            result = run_capped(
+                command, timeout=timeout + 4,
+                stdout_limit=MAX_PEEK_STDOUT_BYTES, stderr_limit=MAX_PEEK_STDERR_BYTES,
+            )
+        except OSError as error:
+            print(str(error), file=sys.stderr)
+            return 126
+        if result.returncode == 0:
+            sys.stdout.write(result.stdout)
+        else:
+            print(str(result.stderr or "Could not read the agent").strip(), file=sys.stderr)
+        return result.returncode
+    if getattr(args, "reply", None) is not None:
+        for command in reply_commands(args.host, args.session, args.target, args.reply, timeout):
+            code = run_quiet(command, timeout + 4)
+            if code != 0:
+                return code
+        return 0
+    if args.focus:
+        command = focus_command(args.host, args.session, args.target, timeout)
+        table = process_table()
+        windows = hyprland_windows()
+        focus_code = None
+        if args.host == "local":
+            local_clients = windows_for_pids(
+                herdr_client_pids(args.session, table), windows, table,
+            )
+            window = window_for_local(
+                args.session, args.workspace, getattr(args, "hostname", ""), windows, table,
+            )
+            if not window and local_clients:
+                focus_code = run_quiet(command, timeout + 4)
+                if focus_code != 0:
+                    return focus_code
+                window = wait_for_local_window(
+                    args.session, args.workspace, getattr(args, "hostname", ""), table,
+                )
+        else:
+            candidates = configured_title_hosts(args.host)
+            if getattr(args, "hostname", ""):
+                candidates |= remote_title_hosts(args.hostname)
+            window = window_for_remote(
+                args.host, args.session, args.workspace, windows, table, candidates,
+            )
+            # A mosh/ssh window is titled for the workspace it is currently
+            # showing. If the notification targets another workspace, focus
+            # it remotely first and give the carrier title a moment to catch
+            # up before deciding that no suitable local window is open.
+            if not window:
+                focus_code = run_quiet(command, timeout + 4)
+                if focus_code != 0:
+                    return focus_code
+                window = wait_for_remote_window(
+                    args.host, args.session, args.workspace, table, candidates,
+                )
+        if raise_window(window):
+            if focus_code is not None:
+                return focus_code
+            try:
+                result = run_capped(
+                    command, timeout=timeout + 4,
+                    stdout_limit=MAX_CONTROL_STDERR_BYTES,
+                    stderr_limit=MAX_CONTROL_STDERR_BYTES,
+                )
+            except FileNotFoundError:
+                print(f"{command[0]} is not installed", file=sys.stderr)
+                return 127
+            except OSError as error:
+                print(str(error), file=sys.stderr)
+                return 126
+            if result.returncode != 0:
+                message = str(result.stderr or result.stdout or "Could not focus HerdR agent").strip()
+                if message:
+                    print(message, file=sys.stderr)
+            return result.returncode
+        # Nothing on screen to raise: open the pane the way A would.
+        launch = ["omarchy-launch-terminal", str(Path(__file__).resolve()), "--host", args.host,
+                  "--session", args.session, "--target", args.target]
+        return exec_or_error(launch)
+
+    command = build_command(args.host, args.session, args.target)
+    return exec_or_error(command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

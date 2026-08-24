@@ -1,0 +1,44 @@
+#!/bin/sh
+# Runs inside HerdR when an agent changes state (see herdr-plugin.toml).
+# It does one thing: ask the bar widget to poll now. No arguments, no event
+# payload is forwarded, and it never fails the hook — a bar that is not
+# running simply has nothing to poke. The diagnostic log is one atomically
+# replaced line, so repeated events can never grow it without bound.
+uid=$(id -u 2>/dev/null) || uid=
+base_dir=${XDG_RUNTIME_DIR:-${uid:+/tmp/omaherd-$uid}}
+case $base_dir in
+  /*) ;;
+  *) base_dir= ;;
+esac
+
+private_dir() {
+  directory=$1
+  [ -n "$directory" ] || return 1
+  if [ ! -e "$directory" ]; then
+    (umask 077 && mkdir "$directory") 2>/dev/null || return 1
+  fi
+  [ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+  [ "$(stat -c %u "$directory" 2>/dev/null)" = "$uid" ] || return 1
+  chmod 700 "$directory" 2>/dev/null || return 1
+}
+
+if private_dir "$base_dir"; then
+  state_dir=$base_dir/omaherd
+  if private_dir "$state_dir"; then
+    case ${HERDR_PLUGIN_EVENT:-event} in
+      pane.agent_status_changed|pane.agent_detected|pane.closed) event=$HERDR_PLUGIN_EVENT ;;
+      *) event=event ;;
+    esac
+    temporary=$(mktemp "$state_dir/.hook.XXXXXX" 2>/dev/null) || temporary=
+    if [ -n "$temporary" ]; then
+      log_file=$state_dir/hook.log
+      (umask 077 && printf '%s %s\n' "$(date +%s)" "$event" > "$temporary") 2>/dev/null \
+        && [ ! -d "$log_file" ] \
+        && mv -f "$temporary" "$log_file" 2>/dev/null
+      [ ! -e "$temporary" ] || rm -f "$temporary" 2>/dev/null
+    fi
+  fi
+fi
+command -v omarchy-shell >/dev/null 2>&1 || exit 0
+omarchy-shell io.github.salemsayed.omaherd poke >/dev/null 2>&1 || true
+exit 0

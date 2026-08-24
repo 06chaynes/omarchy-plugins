@@ -1,0 +1,118 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.salemsayed.omaherd",
+  "name": "Omaherd",
+  "version": "0.6.2",
+  "author": "Salem Sayed",
+  "license": "MIT",
+  "description": "A local and remote HerdR attention inbox for the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omaherd",
+    "description": "See every HerdR agent, what it is doing, and who is waiting on you — local and remote — and jump straight to the pane.",
+    "category": "AI",
+    "aliases": [
+      "herdr",
+      "agents",
+      "agent-inbox"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 4,
+      "remoteHosts": "",
+      "sshTimeoutSec": 3,
+      "groupBy": "Attention",
+      "barHerd": true,
+      "notifyOn": "Needs input and done",
+      "ignoredHosts": "",
+      "peekAndReply": false,
+      "instantUpdates": true
+    },
+    "schema": [
+      {
+        "key": "groupBy",
+        "type": "enum",
+        "label": "Group agents by",
+        "options": [
+          "Attention",
+          "Host"
+        ],
+        "defaultValue": "Attention",
+        "description": "Attention lists whoever needs you first across every host. Host keeps each machine's agents together. G in the panel flips this."
+      },
+      {
+        "key": "barHerd",
+        "type": "boolean",
+        "label": "Show the herd in the bar",
+        "defaultValue": true,
+        "description": "Draw one dot per active agent beside the sheep — working or needing you — so the herd is readable without opening the panel. Quiet agents add nothing."
+      },
+      {
+        "key": "instantUpdates",
+        "type": "boolean",
+        "label": "Instant updates",
+        "defaultValue": true,
+        "description": "Link Omaherd's HerdR hook (herdr plugin link) so a local agent's state change reaches the bar at once instead of on the next poll. Turning this off does not unlink; run `herdr plugin unlink io.github.salemsayed.omaherd`."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 4,
+        "description": "How often Omaherd refreshes local and remote agent state."
+      },
+      {
+        "key": "remoteHosts",
+        "type": "string",
+        "label": "Monitored remote hosts",
+        "defaultValue": "",
+        "description": "Hosts Omaherd monitors in the background. Clicking Monitor adds discovered hosts here automatically."
+      },
+      {
+        "key": "ignoredHosts",
+        "type": "string",
+        "label": "Hidden hosts",
+        "defaultValue": "",
+        "description": "Discovered hosts Omaherd should stop offering. X on a host in the panel adds it here."
+      },
+      {
+        "key": "sshTimeoutSec",
+        "type": "integer",
+        "label": "SSH timeout (seconds)",
+        "min": 1,
+        "max": 15,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "Connection timeout for background checks of remote HerdR hosts."
+      },
+      {
+        "key": "notifyOn",
+        "type": "enum",
+        "label": "Notify when an agent",
+        "options": [
+          "Needs input and done",
+          "Needs input only",
+          "Off"
+        ],
+        "defaultValue": "Needs input and done",
+        "description": "One toast per agent, replaced as its state changes and withdrawn once it stops waiting. Clicking a toast brings the agent to the front."
+      },
+      {
+        "key": "peekAndReply",
+        "type": "boolean",
+        "label": "Peek and reply from the panel",
+        "defaultValue": false,
+        "description": "Lets P show an agent's last terminal lines and I type a reply into its pane. Off by default: this is the only feature that reads pane output, and only when you ask."
+      }
+    ]
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "id": "bottelet.is-it-down",
+  "name": "Is It Down?",
+  "version": "1.0.0",
+  "author": "Casper Bottelet",
+  "license": "MIT",
+  "description": "Is it me or is it down? Watches the status pages of services you depend on (GitHub, AWS, Cloudflare, npm, ...) from the bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Is It Down?",
+    "description": "Detective icon that badges up when a service you depend on is having trouble",
+    "category": "Info",
+    "allowMultiple": false,
+    "schema": [
+      {
+        "key": "services",
+        "type": "multiselect",
+        "label": "Services",
+        "description": "Choose which service status pages to watch. Leave empty for the default set.",
+        "noSelectionText": "Default: GitHub, AWS, Cloudflare, npm",
+        "placeholderText": "Search services...",
+        "emptyText": "No services",
+        "options": [
+          { "value": "github", "label": "GitHub", "description": "githubstatus.com" },
+          { "value": "aws", "label": "AWS", "description": "AWS Health Dashboard" },
+          { "value": "cloudflare", "label": "Cloudflare", "description": "cloudflarestatus.com" },
+          { "value": "npm", "label": "npm", "description": "status.npmjs.org" },
+          { "value": "claude", "label": "Claude", "description": "status.claude.com" },
+          { "value": "openai", "label": "OpenAI", "description": "status.openai.com" },
+          { "value": "vercel", "label": "Vercel", "description": "vercel-status.com" },
+          { "value": "pypi", "label": "PyPI", "description": "status.python.org" },
+          { "value": "discord", "label": "Discord", "description": "discordstatus.com" },
+          { "value": "netlify", "label": "Netlify", "description": "netlifystatus.com" }
+        ]
+      },
+      {
+        "key": "awsIgnoreRegions",
+        "type": "multiselect",
+        "label": "AWS: ignore regions",
+        "description": "AWS events in these regions are ignored — they won't badge the icon or show in the panel.",
+        "noSelectionText": "Watch all regions",
+        "placeholderText": "Search regions...",
+        "emptyText": "No regions",
+        "options": [
+          { "value": "us-east-1", "label": "us-east-1", "description": "N. Virginia" },
+          { "value": "us-east-2", "label": "us-east-2", "description": "Ohio" },
+          { "value": "us-west-1", "label": "us-west-1", "description": "N. California" },
+          { "value": "us-west-2", "label": "us-west-2", "description": "Oregon" },
+          { "value": "ca-central-1", "label": "ca-central-1", "description": "Canada Central" },
+          { "value": "sa-east-1", "label": "sa-east-1", "description": "São Paulo" },
+          { "value": "eu-west-1", "label": "eu-west-1", "description": "Ireland" },
+          { "value": "eu-west-2", "label": "eu-west-2", "description": "London" },
+          { "value": "eu-west-3", "label": "eu-west-3", "description": "Paris" },
+          { "value": "eu-central-1", "label": "eu-central-1", "description": "Frankfurt" },
+          { "value": "eu-central-2", "label": "eu-central-2", "description": "Zurich" },
+          { "value": "eu-north-1", "label": "eu-north-1", "description": "Stockholm" },
+          { "value": "eu-south-1", "label": "eu-south-1", "description": "Milan" },
+          { "value": "eu-south-2", "label": "eu-south-2", "description": "Spain" },
+          { "value": "me-central-1", "label": "me-central-1", "description": "UAE" },
+          { "value": "me-south-1", "label": "me-south-1", "description": "Bahrain" },
+          { "value": "il-central-1", "label": "il-central-1", "description": "Tel Aviv" },
+          { "value": "af-south-1", "label": "af-south-1", "description": "Cape Town" },
+          { "value": "ap-south-1", "label": "ap-south-1", "description": "Mumbai" },
+          { "value": "ap-south-2", "label": "ap-south-2", "description": "Hyderabad" },
+          { "value": "ap-southeast-1", "label": "ap-southeast-1", "description": "Singapore" },
+          { "value": "ap-southeast-2", "label": "ap-southeast-2", "description": "Sydney" },
+          { "value": "ap-southeast-3", "label": "ap-southeast-3", "description": "Jakarta" },
+          { "value": "ap-southeast-4", "label": "ap-southeast-4", "description": "Melbourne" },
+          { "value": "ap-northeast-1", "label": "ap-northeast-1", "description": "Tokyo" },
+          { "value": "ap-northeast-2", "label": "ap-northeast-2", "description": "Seoul" },
+          { "value": "ap-northeast-3", "label": "ap-northeast-3", "description": "Osaka" },
+          { "value": "ap-east-1", "label": "ap-east-1", "description": "Hong Kong" },
+          { "value": "global", "label": "global", "description": "Global / non-regional events" }
+        ]
+      }
+    ]
+  }
+}

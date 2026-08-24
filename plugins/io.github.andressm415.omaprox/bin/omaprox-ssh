@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+# Open an SSH console, setting up key authentication the first time so there is
+# never a password prompt again.
+#
+#   omaprox-ssh [--vmid N --guess NAME] <user> <host> [command...]
+#
+# Deliberately does NOT store an SSH password anywhere. A stored password is a
+# worse version of the thing SSH already solves properly: an authorized key is
+# remembered by the server, survives password changes, can be revoked on its
+# own, and is never transmitted. So the first connection offers to install your
+# public key — one password, once — and every connection after that is silent.
+#
+# Answer no and it simply connects; you will be asked for a password each time,
+# which is the same behaviour as before.
+#
+# `--vmid`/`--guess` are only ever passed for a guest's own address (the `pct
+# enter`/node calls never pass them, and target the node directly — they never
+# need any of this). An empty `<host>` alongside them means the panel could not
+# resolve a real address and this is being asked for one, once, to remember.
+
+set -uo pipefail
+
+VMID=""
+GUESS=""
+while [[ ${1:-} == --* ]]; do
+  case $1 in
+    # Everything after this is data, however much it looks like an option.
+    --) shift; break ;;
+    --vmid)
+      [[ $# -ge 2 ]] || { echo "--vmid needs a value" >&2; exit 2; }
+      VMID=$2; shift 2 ;;
+    --guess)
+      [[ $# -ge 2 ]] || { echo "--guess needs a value" >&2; exit 2; }
+      GUESS=$2; shift 2 ;;
+    *) break ;;
+  esac
+done
+
+# A vmid is a Proxmox integer, and it is matched against the contents of the
+# stores below. A key carrying metacharacters is a key that can be read as
+# something other than a name.
+if [[ -n $VMID && ! $VMID =~ ^[0-9]+$ ]]; then
+  echo "omaprox-ssh: refusing a non-numeric vmid" >&2
+  exit 2
+fi
+
+USER_NAME=${1:-root}
+HOST=${2:-}
+shift 2 2>/dev/null || true
+REMOTE_COMMAND=("$@")
+
+ADDRESSES_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/omaprox/addresses
+
+# `vmid = address`, one per line, the same `key = value` shape as the token
+# file. Proxmox enforces cluster-wide unique vmids, so the vmid alone is
+# enough to key on — no need to also track which node or guest type.
+# The key is compared as a literal string rather than interpolated into a
+# regex or a sed script; `awk -v` hands it over as data.
+lookup_in() {
+  [[ -n $VMID && -f $1 ]] || return 1
+  local v
+  v=$(awk -v k="$VMID" '
+        { eq = index($0, "=")
+          if (eq == 0) next
+          key = substr($0, 1, eq - 1); val = substr($0, eq + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", key)
+          sub(/^[ \t]+/, "", val)
+          if (key == k) out = val }
+        END { if (out != "") print out }' "$1")
+  [[ -n $v ]] || return 1
+  printf '%s' "$v"
+}
+
+# One entry is one line. A value carrying a newline would forge an entry for a
+# vmid nobody touched, pinning another guest's console to a host of its
+# choosing — the guest name reaches here as a fallback, so it must be checked.
+store_in() {
+  [[ -n $VMID ]] || return 0
+  case $2 in
+    *$'\n'* | *$'\r'*)
+      echo "omaprox-ssh: refusing to store a multi-line value" >&2
+      return 1 ;;
+  esac
+  mkdir -p "$(dirname "$1")"
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  { [[ -f $1 ]] && awk -v k="$VMID" '
+        { eq = index($0, "=")
+          if (eq > 0) {
+            key = substr($0, 1, eq - 1)
+            gsub(/^[ \t]+|[ \t]+$/, "", key)
+            if (key == k) next
+          }
+          print }' "$1"
+    [[ -n $2 ]] && printf '%s = %s\n' "$VMID" "$2"; } >"$tmp"
+  mv "$tmp" "$1" || { rm -f "$tmp"; return 1; }
+}
+
+lookup_address() { lookup_in "$ADDRESSES_FILE"; }
+
+store_address() { store_in "$ADDRESSES_FILE" "$1"; }
+
+# The guest's own web page, in a second file of the same shape — see
+# bin/omaprox-rdp, which asks the same question and writes the same store.
+WEBPAGES_FILE=${XDG_CONFIG_HOME:-$HOME/.config}/omaprox/webpages
+
+lookup_webpage() { lookup_in "$WEBPAGES_FILE"; }
+store_webpage()  { store_in "$WEBPAGES_FILE" "$1"; }
+
+if [[ -z $HOST && -n $VMID ]]; then
+  HOST=$(lookup_address) || HOST=""
+  if [[ -z $HOST ]]; then
+    echo
+    echo "  No known address for ${GUESS:-this guest} (vmid $VMID)."
+    echo "  Asked once, then remembered in $ADDRESSES_FILE."
+    echo "  (Press F on the guest to be asked again.)"
+    echo
+    read -rp "  Address or hostname: " HOST
+    if [[ -z $HOST ]]; then
+      HOST=$GUESS
+      echo "  Using '$HOST' — that may not resolve to anything."
+    fi
+    echo
+    store_address "$HOST"
+    echo
+  fi
+fi
+
+# Asked once per guest, the first time a console opens for it, and never again
+# — a stored answer (including a deliberately empty one) skips this entirely.
+#
+# Outside the address block on purpose. A container's console is `pct enter` on
+# its node, so its host is the node's and is always known; gated on the address
+# being missing, this question could never reach one, and a container running a
+# service is the guest most likely to have a page worth pinning.
+if [[ -n $VMID ]] && ! lookup_webpage >/dev/null; then
+  echo
+  read -rp "  Web page for ${GUESS:-this guest} (blank for the Proxmox page): " webpage
+  webpage=${webpage// /}
+  # Recorded either way. Blank means "no page, stop asking"; the store keeps a
+  # marker line so the question does not come back on every console, and F
+  # clears it along with everything else when you want to be asked again.
+  if [[ -n $webpage ]]; then
+    store_webpage "$webpage"
+  else
+    store_webpage "-"
+  fi
+  echo
+fi
+
+if [[ -z $HOST ]]; then
+  echo "usage: omaprox-ssh [--vmid N --guess NAME] <user> <host> [command...]" >&2
+  exit 2
+fi
+
+TARGET="$USER_NAME@$HOST"
+
+connect() {
+  if ((${#REMOTE_COMMAND[@]})); then
+    exec ssh -t "$TARGET" "${REMOTE_COMMAND[@]}"
+  else
+    exec ssh -t "$TARGET"
+  fi
+}
+
+# Already trusted? Then nothing to arrange — go straight in. BatchMode makes ssh
+# fail rather than fall back to asking, which is what makes this a test.
+if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+       "$TARGET" true 2>/dev/null; then
+  connect
+fi
+
+# No key auth. Is there a key to offer?
+KEY=""
+for candidate in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub" "$HOME/.ssh/id_ecdsa.pub"; do
+  [[ -f $candidate ]] && { KEY=$candidate; break; }
+done
+
+if [[ -z $KEY ]] || ! command -v ssh-copy-id >/dev/null 2>&1; then
+  connect
+fi
+
+cat <<EOF
+
+  $TARGET asks for a password every time.
+
+  Installing your public key makes that the last one:
+      $KEY
+
+  This appends the key to ~/.ssh/authorized_keys on $HOST. It grants this
+  machine passwordless access to that account until you remove the key there.
+
+EOF
+
+read -rp "  Install it now? [y/N] " reply
+echo
+
+case ${reply,,} in
+  y | yes)
+    if ssh-copy-id -i "$KEY" "$TARGET"; then
+      echo
+      echo "  Installed. This is the last time you will be asked."
+      echo
+    else
+      echo
+      echo "  Could not install the key — connecting with a password instead."
+      echo
+    fi
+    ;;
+  *)
+    echo "  Skipped. Connecting with a password."
+    echo
+    ;;
+esac
+
+connect

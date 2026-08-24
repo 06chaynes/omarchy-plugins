@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Raise, replace, or withdraw an Omaherd desktop notification.
+
+One notification per agent: a later event for the same agent replaces the
+toast in place, and when the agent stops waiting the toast is withdrawn, so
+the screen only ever shows what is still true. Clicking a toast brings the
+agent to the front through the attach helper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import time
+import shlex
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+from omaherd_io import ensure_private_directory, private_runtime_directory, run_capped
+
+
+APP_NAME = "Omaherd"
+GLYPHS = {"blocked": "󰳆", "done": "󰳆"}
+URGENCY = {"blocked": "critical", "done": "normal"}
+# Needs-input toasts are urgent, which the shell keeps on screen until they
+# are dismissed — or until Omaherd withdraws them because the agent moved on.
+EXPIRE_MS = {"blocked": 0, "done": 12000}
+MAX_COMMAND_STDOUT_BYTES = 64 * 1024
+MAX_COMMAND_STDERR_BYTES = 32 * 1024
+MAX_STORE_BYTES = 256 * 1024
+MAX_STORE_ENTRIES = 2048
+
+
+def state_path() -> Path:
+    runtime = private_runtime_directory()
+    if runtime is None:
+        raise OSError("Could not create a private Omaherd runtime directory")
+    return runtime / "notifications.json"
+
+
+@contextlib.contextmanager
+def store_lock(path: Path):
+    """One poll can fan out into several of these processes at once — seven
+    agents going loud together is seven raises — and each reads, edits and
+    rewrites the same file. The lock makes them take turns so no toast's
+    record is lost to a later writer."""
+    lock_path = path.with_suffix(".lock")
+    try:
+        if not ensure_private_directory(path.parent):
+            raise OSError("Could not create private notification directory")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        handle = os.fdopen(descriptor, "a+")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def load_ids(path: Path) -> dict[str, dict]:
+    """key -> {"id": int, "summary": str} for every toast still up."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as handle:
+            payload = handle.read(MAX_STORE_BYTES + 1)
+        if len(payload) > MAX_STORE_BYTES:
+            return {}
+        raw = json.loads(payload.decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    ids: dict[str, dict] = {}
+    for key, value in list(raw.items())[:MAX_STORE_ENTRIES]:
+        try:
+            if isinstance(value, dict):
+                ids[str(key)] = {"id": int(value.get("id") or 0), "summary": str(value.get("summary") or ""),
+                                 "at": float(value.get("at") or 0), "closing": bool(value.get("closing")),
+                                 "revision": int(value.get("revision") or 0), "closed": bool(value.get("closed"))}
+            else:
+                ids[str(key)] = {"id": int(value), "summary": "", "at": 0.0, "closing": False,
+                                 "revision": 0, "closed": False}
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+# A toast either gets withdrawn by Omaherd or dismissed by a person well
+# inside a day; an entry older than that is a leftover from a shell restart
+# and only clutters the file.
+STALE_AFTER_S = 24 * 3600
+
+
+def prune(ids: dict[str, dict], now: float, max_age: float = STALE_AFTER_S) -> dict[str, dict]:
+    kept: dict[str, dict] = {}
+    for key, entry in ids.items():
+        stamped = float(entry.get("at") or 0)
+        # A pending withdrawal is work, not a leftover. Dropping it because
+        # the shell stayed down for a day would make the stale card permanent.
+        if entry.get("closing") or stamped <= 0 or now - stamped <= max_age:
+            kept[key] = entry
+    return kept
+
+
+def save_ids(path: Path, ids: dict[str, dict]) -> None:
+    temporary: Path | None = None
+    try:
+        if not ensure_private_directory(path.parent):
+            return
+        payload = json.dumps(dict(list(ids.items())[:MAX_STORE_ENTRIES]), separators=(",", ":"))
+        encoded = payload.encode("utf-8")
+        if len(encoded) > MAX_STORE_BYTES:
+            return
+        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+        os.replace(temporary, path)
+    except OSError:
+        pass
+    finally:
+        try:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def build_command(
+    kind: str, summary: str, body: str, exec_command: str = "",
+    replace_id: int = 0, use_omarchy: bool = True,
+) -> list[str]:
+    """The notify command. Through omarchy-notification-send when the shell's
+    glyph and click hints are available; bare notify-send otherwise."""
+    urgency = URGENCY.get(kind, "normal")
+    expire = EXPIRE_MS.get(kind, 8000)
+    tail = ["-p"]
+    if replace_id > 0:
+        tail.extend(["-r", str(replace_id)])
+    tail.extend(["-t", str(expire)])
+    if use_omarchy:
+        command = ["omarchy-notification-send", "--app-name", APP_NAME,
+                   "-u", urgency, "-g", GLYPHS.get(kind, GLYPHS["done"])]
+        if exec_command:
+            command.extend(["--exec", exec_command])
+        command.append(summary)
+        if body:
+            command.append(body)
+        return command + tail
+    command = ["notify-send", "-a", APP_NAME, "-u", urgency, *tail, summary]
+    if body:
+        command.append(body)
+    return command
+
+
+def close_commands(notification_id: int, summary: str, use_omarchy: bool = True) -> list[list[str]]:
+    """Everything it takes to withdraw a toast. The Omarchy shell keeps a
+    card up after a D-Bus close, so it is asked by summary through its own
+    IPC; the D-Bus close still covers any other notification daemon."""
+    commands: list[list[str]] = []
+    if use_omarchy and summary:
+        commands.append(["omarchy-shell", "notifications", "dismiss", summary])
+    if notification_id > 0:
+        commands.append([
+            "gdbus", "call", "--session",
+            "--dest", "org.freedesktop.Notifications",
+            "--object-path", "/org/freedesktop/Notifications",
+            "--method", "org.freedesktop.Notifications.CloseNotification",
+            str(notification_id),
+        ])
+    return commands
+
+
+def parse_id(output: str) -> int:
+    found = 0
+    for line in str(output or "").splitlines():
+        line = line.strip()
+        if line.isdigit():
+            found = int(line)
+    return found
+
+
+def focus_exec(
+    helper: str, host: str, session: str, target: str, workspace: str, hostname: str = "",
+) -> str:
+    command = [helper, "--host", host, "--session", session,
+               "--target", target, "--workspace", workspace]
+    if hostname:
+        command.extend(["--hostname", hostname])
+    command.append("--focus")
+    return shlex.join(command)
+
+
+def withdraw(entry: dict, use_omarchy: bool) -> bool:
+    """Take one toast down. True when every daemon we asked answered; a
+    daemon that is mid-restart answers nothing, and the entry stays pending
+    so the next invocation asks again."""
+    done = True
+    for command in close_commands(int(entry.get("id") or 0), str(entry.get("summary") or ""), use_omarchy):
+        try:
+            result = run_capped(
+                command, timeout=3,
+                stdout_limit=MAX_COMMAND_STDOUT_BYTES,
+                stderr_limit=MAX_COMMAND_STDERR_BYTES,
+            )
+        except FileNotFoundError:
+            # An unavailable integration cannot have a live endpoint to wait
+            # for. Other available close mechanisms still get their turn.
+            continue
+        except OSError:
+            done = False
+            continue
+        if result.returncode != 0:
+            done = False
+        elif command[0] == "omarchy-shell" and not result.stdout.strip():
+            done = False
+    return done
+
+
+def closed_entry(entry: dict, now: float | None = None) -> dict:
+    return {
+        "id": 0,
+        "summary": "",
+        "at": time.time() if now is None else now,
+        "closing": False,
+        "revision": int(entry.get("revision") or 0),
+        "closed": True,
+    }
+
+
+def settle(ids: dict[str, dict], use_omarchy: bool) -> dict[str, dict]:
+    """Retry every withdrawal that did not go through last time."""
+    for key, entry in list(ids.items()):
+        if entry.get("closing") and withdraw(entry, use_omarchy):
+            if int(entry.get("revision") or 0) > 0:
+                ids[key] = closed_entry(entry)
+            else:
+                ids.pop(key, None)
+    return ids
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--key", default="", help="Agent key the toast belongs to")
+    parser.add_argument("--kind", choices=["blocked", "done", "close", "reconcile"], required=True)
+    parser.add_argument("--keep", action="append", default=[],
+                        help="reconcile: agent keys whose toasts are still true; every other stored toast comes down")
+    parser.add_argument("--summary", default="")
+    parser.add_argument("--body", default="")
+    parser.add_argument("--host", default="local")
+    parser.add_argument("--session", default="default")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--workspace", default="")
+    parser.add_argument("--hostname", default="")
+    parser.add_argument("--revision", type=int, default=0,
+                        help="Monotonic snapshot revision used to discard out-of-order helper processes")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = arguments()
+    try:
+        path = state_path()
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    with store_lock(path):
+        return run(args, path)
+
+
+def run(args: argparse.Namespace, path: Path) -> int:
+    use_omarchy_sender = shutil.which("omarchy-notification-send") is not None
+    use_omarchy_shell = shutil.which("omarchy-shell") is not None
+    now = time.time()
+    ids = prune(load_ids(path), now)
+    revision = max(0, int(getattr(args, "revision", 0) or 0))
+
+    # After a shell restart the popups come back but the service's memory
+    # does not: everything we still hold a toast for that is no longer loud
+    # comes down now.
+    if args.kind == "reconcile":
+        keep = set(args.keep)
+        for key, entry in list(ids.items()):
+            stored_revision = int(entry.get("revision") or 0)
+            if revision > 0 and stored_revision >= revision:
+                continue
+            # Notification ids belong to one server generation. The shell
+            # may have restarted and handed the old number to an unrelated
+            # app, so reconciliation never sends a stored id back over D-Bus.
+            entry["id"] = 0
+            if revision > 0:
+                entry["revision"] = revision
+            if key in keep:
+                entry["closing"] = False
+                entry["closed"] = False
+                entry["at"] = now
+                continue
+            entry["closing"] = True
+            if withdraw(entry, use_omarchy_shell):
+                if revision > 0:
+                    ids[key] = closed_entry(entry, now)
+                else:
+                    ids.pop(key, None)
+        save_ids(path, ids)
+        return 0
+
+    if not args.key:
+        raise SystemExit("--key is required")
+    ids = settle(ids, use_omarchy_shell)
+    existing = ids.get(args.key, {"id": 0, "summary": "", "at": 0.0,
+                                  "closing": False, "revision": 0, "closed": False})
+    if revision > 0 and int(existing.get("revision") or 0) >= revision:
+        save_ids(path, ids)
+        return 0
+
+    if args.kind == "close":
+        if revision > 0:
+            existing["revision"] = revision
+        if existing.get("id") or existing.get("summary"):
+            existing["closing"] = True
+            if withdraw(existing, use_omarchy_shell):
+                if revision > 0:
+                    ids[args.key] = closed_entry(existing, now)
+                else:
+                    ids.pop(args.key, None)
+            else:
+                ids[args.key] = existing
+        elif revision > 0:
+            ids[args.key] = closed_entry(existing, now)
+        save_ids(path, ids)
+        return 0
+
+    # A kept popup restored by the shell deliberately has id zero: its old id
+    # may now belong to another app. Withdraw it by summary before raising the
+    # changed state as a fresh notification with a current-generation id.
+    if not existing.get("closed") and not existing.get("id") and existing.get("summary"):
+        if not withdraw(existing, use_omarchy_shell):
+            existing["closing"] = True
+            if revision > 0:
+                existing["revision"] = revision
+            ids[args.key] = existing
+            save_ids(path, ids)
+            return 1
+        ids.pop(args.key, None)
+        existing = {"id": 0, "summary": "", "at": 0.0, "closing": False,
+                    "revision": 0, "closed": True}
+
+    helper = str(Path(sys.argv[0]).resolve().parent / "omaherd-attach")
+    exec_command = focus_exec(helper, args.host, args.session, args.target, args.workspace,
+                              getattr(args, "hostname", "")) \
+        if args.target else ""
+    command = build_command(args.kind, args.summary, args.body, exec_command,
+                            int(existing.get("id") or 0), use_omarchy_sender)
+    try:
+        result = run_capped(
+            command, timeout=5,
+            stdout_limit=MAX_COMMAND_STDOUT_BYTES,
+            stderr_limit=MAX_COMMAND_STDERR_BYTES,
+        )
+    except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        save_ids(path, ids)
+        return 127
+    except OSError as error:
+        print(str(error), file=sys.stderr)
+        save_ids(path, ids)
+        return 126
+    if result.returncode != 0:
+        message = str(result.stderr or result.stdout or "Notification command failed").strip()
+        if message:
+            print(message, file=sys.stderr)
+        save_ids(path, ids)
+        return result.returncode or 1
+    new_id = parse_id(result.stdout)
+    if new_id or args.summary:
+        ids[args.key] = {"id": new_id, "summary": args.summary, "at": time.time(),
+                         "closing": False, "revision": revision, "closed": False}
+    save_ids(path, ids)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

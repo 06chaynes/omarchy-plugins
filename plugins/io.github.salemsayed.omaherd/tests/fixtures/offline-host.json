@@ -1,0 +1,55 @@
+{
+ "ok": true,
+ "installed": true,
+ "generatedAt": 0,
+ "statusText": "No active agents",
+ "targets": [
+  {
+   "host": "local",
+   "local": true,
+   "reachable": true,
+   "installed": true,
+   "running": false,
+   "sessions": [
+    {
+     "name": "default",
+     "default": true,
+     "running": true,
+     "agentCount": 0,
+     "error": ""
+    }
+   ],
+   "agents": [],
+   "error": ""
+  },
+  {
+   "host": "workbox",
+   "local": false,
+   "reachable": false,
+   "installed": true,
+   "running": false,
+   "sessions": [],
+   "agents": [],
+   "error": "ssh: connect to host workbox port 22: No route to host"
+  }
+ ],
+ "discoveredHosts": [
+  {
+   "host": "workbox",
+   "source": "SSH config",
+   "detail": "Configured SSH host"
+  }
+ ],
+ "agents": [],
+ "counts": {
+  "total": 0,
+  "attention": 0,
+  "blocked": 0,
+  "done": 0,
+  "working": 0,
+  "idle": 0,
+  "unknown": 0
+ },
+ "hasErrors": true,
+ "lastError": "workbox: ssh: connect to host workbox port 22: No route to host"
+}

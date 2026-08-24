@@ -1,0 +1,23 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # qmllint needs the Omarchy shell's qs.* modules to say anything useful,
+      # so the QML lint runs on Omarchy machines (tests/run) rather than here.
+      - name: Shell scripts
+        run: shellcheck -e SC2012 omaherd-hook tests/run tools/demo/capture.sh
+      - name: Run the suite
+        run: ./tests/run

@@ -1,0 +1,49 @@
+#!/bin/bash
+
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+node --test "$root/tests/Model.test.js" "$root/tests/IpcLifecycle.test.js" \
+  "$root/tests/QmlLifecycle.test.js" "$root/tests/Stress.test.js"
+python3 "$root/tests/test_status.py"
+python3 "$root/tests/test_io.py"
+python3 "$root/tests/test_stress.py"
+python3 "$root/tests/test_attach.py"
+python3 "$root/tests/test_notify.py"
+python3 -m json.tool "$root/manifest.json" >/dev/null
+
+# QML checks. The plugin imports the Omarchy shell's `qs.*` modules, which
+# qmllint can only resolve through a directory literally named `qs`; when the
+# shell is installed, borrow it through a symlink. Style-only categories stay
+# informational; real problems (shadowed properties, bad signal handlers,
+# syntax) fail the run.
+qmllint=$(command -v qmllint || ls /usr/lib/qt6/bin/qmllint 2>/dev/null || true)
+shell_dir=${OMARCHY_SHELL_DIR:-/usr/share/omarchy/shell}
+if [[ -n $qmllint && -d $shell_dir ]]; then
+  # Without the shell's modules every `qs.*` type is unknown and qmllint
+  # drowns in noise it cannot be told to ignore, so the lint is an
+  # Omarchy-machine gate, not a CI one.
+  link_dir=$(mktemp -d)
+  ln -s "$shell_dir" "$link_dir/qs"
+  imports=(-I "$link_dir")
+  trap 'rm -rf "$link_dir"' EXIT
+  # Quickshell's own QML dir lets qmllint see Process, IpcHandler and friends.
+  [[ -d /usr/lib/qt6/qml/Quickshell ]] && imports+=(-I /usr/lib/qt6/qml)
+  # Older qmllint builds (Ubuntu's) lack some category switches and -W; only
+  # pass what this one understands. signal-handler-parameters: Quickshell's
+  # Process.exited carries a QProcess::ExitStatus that qmllint cannot resolve
+  # even with the module path; the handler is correct at runtime.
+  help_text=$("$qmllint" --help 2>&1 || true)
+  lint_args=()
+  for category in unqualified missing-property import unused-imports deprecated signal-handler-parameters; do
+    grep -q -- "--$category" <<<"$help_text" && lint_args+=("--$category" disable)
+  done
+  grep -q -- "--max-warnings" <<<"$help_text" && lint_args+=(-W 0)
+  "$qmllint" "${imports[@]}" "${lint_args[@]}" "$root"/*.qml
+  echo "qmllint passed"
+else
+  echo "qmllint or the Omarchy shell not found; skipping QML checks"
+fi
+
+echo "All Omaherd tests passed"
