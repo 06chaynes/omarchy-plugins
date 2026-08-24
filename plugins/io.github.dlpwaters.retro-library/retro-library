@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+plugin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python_bin="$(command -v python3 || true)"
+if [[ -z "$python_bin" ]]; then
+  printf 'Retro Library requires Python 3.\n' >&2
+  exit 1
+fi
+exec "$python_bin" "$plugin_dir/retro_library.py" "$@"

@@ -99,3 +99,9 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added Apple Music dropdown, compact queue, live audio spectrum, and mini-player plugin.
 - Added full-screen layer-shell click backdrop in `BarWidget.qml` to prevent accidental hover focus loss under `follow_mouse = 1` while ensuring clean click-away dismissal.
 - Integrated into center bar layout.
+
+## io.github.dlpwaters.retro-library
+
+- Added Retro Library console-organized RetroArch launcher and playlist browser.
+- Multi-system navigation, local box art previews, search, favorites, and 1-click ROM/save folder actions.
+- Integrated into center bar layout.
