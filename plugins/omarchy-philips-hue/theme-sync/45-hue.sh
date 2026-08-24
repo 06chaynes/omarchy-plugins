@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-source "${THPM_THEME_ENV:-$HOME/.local/share/thpm/lib/theme-env.sh}"
+[[ -f "${THPM_THEME_ENV:-$HOME/.local/share/thpm/lib/theme-env.sh}" ]] && source "${THPM_THEME_ENV:-$HOME/.local/share/thpm/lib/theme-env.sh}" || true
 set -u
 
 THEME_SLUG="${1:-}"
@@ -250,9 +250,9 @@ if configured and "all" not in configured:
 else:
     targets = [gid for gid, g in groups.items() if room_or_zone(g)]
 
-# Per-room theme sync toggle: filter targets based on themeSync dict
+# Per-room theme sync toggle: filter targets based on themeSync dict (default: false)
 theme_sync = cfg.get("themeSync") or {}
-targets = [gid for gid in targets if theme_sync.get(gid, True)]
+targets = [gid for gid in targets if theme_sync.get(gid, False)]
 
 body = {"hue": hue, "sat": sat, "transitiontime": transition}
 if cfg.get("bri") is not None:

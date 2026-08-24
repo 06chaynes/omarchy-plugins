@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -20,6 +21,7 @@ Panel {
   property var rooms: []
   property var roomsWithLights: []
   property var orphanLights: []
+  property var expandedRooms: ({})
   property int pendingFetches: 0
   property bool loading: false
   property bool lastFetchFailed: false
@@ -29,7 +31,33 @@ Panel {
   readonly property int lightTotal: root.lightsTotal()
   readonly property int lightedRoomCount: root.lightedRooms().length
   readonly property bool allLightsOn: root.computeAllLightsOn()
+  readonly property bool allRoomsExpanded: {
+    if (root.roomCount === 0) return false
+    for (var i = 0; i < root.roomsWithLights.length; i++) {
+      if (root.expandedRooms[root.roomsWithLights[i].id] !== true) return false
+    }
+    return true
+  }
   readonly property bool insecureMode: root.config !== null && !root.config.bridgeId
+
+  function isRoomExpanded(roomId) {
+    return root.expandedRooms[roomId] === true
+  }
+
+  function toggleRoomExpanded(roomId) {
+    var er = Object.assign({}, root.expandedRooms)
+    er[roomId] = !root.isRoomExpanded(roomId)
+    root.expandedRooms = er
+  }
+
+  function toggleAllExpanded() {
+    var shouldExpand = !root.allRoomsExpanded
+    var er = {}
+    for (var i = 0; i < root.roomsWithLights.length; i++) {
+      er[root.roomsWithLights[i].id] = shouldExpand
+    }
+    root.expandedRooms = er
+  }
 
   readonly property string statusText: {
     if (root.config === null) return "Not paired"
@@ -228,7 +256,7 @@ Panel {
   }
 
   function roomSyncOn(roomId) {
-    return root.themeSync[roomId] !== false
+    return root.themeSync[roomId] === true
   }
 
   function toggleColorPicker(lightId) {
@@ -427,7 +455,7 @@ Panel {
     open: root.opened
     centerOnBar: true
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(540))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -443,7 +471,19 @@ Panel {
         contentHeight: column.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+        WheelHandler {
+          target: scroll
+          acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+          onWheel: function(event) {
+            var step = 80
+            var delta = event.angleDelta.y > 0 ? -step : step
+            scroll.contentY = Math.max(0, Math.min(scroll.contentHeight - scroll.height, scroll.contentY + delta))
+          }
+        }
 
         Column {
           id: column
@@ -590,21 +630,118 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
-          Toggle {
+          BorderSurface {
             visible: root.config !== null && root.lightedRoomCount > 0
             width: parent.width
-            label: "All lights"
-            checked: root.allLightsOn
-            foreground: root.bar.foreground
-            accent: Color.accent
-            fontFamily: root.bar.fontFamily
-            onClicked: root.toggleAll(!root.allLightsOn)
+            implicitHeight: Style.space(48)
+            radius: Style.cornerRadius
+            color: Style.controlFill(false, allLightsMouse.containsMouse, root.bar.foreground, Color.accent)
+            borderSpec: Border.controlSpec(allLightsMouse.containsMouse ? "hover-cursor" : "normal", root.bar.foreground, Color.accent)
+
+            MouseArea {
+              id: allLightsMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.toggleAll(!root.allLightsOn)
+            }
+
+            Row {
+              anchors.left: parent.left
+              anchors.leftMargin: Style.space(12)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(10)
+
+              Text {
+                anchors.verticalCenter: parent.verticalCenter
+                text: "󰌵"
+                color: root.allLightsOn ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.title
+              }
+
+              Column {
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: 1
+
+                Text {
+                  text: "All Lights"
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.body
+                  font.bold: true
+                }
+
+                Text {
+                  text: root.lightTotal + " lights in " + root.roomCount + " rooms"
+                  color: Qt.darker(root.bar.foreground, 1.6)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+            }
+
+            Row {
+              anchors.right: parent.right
+              anchors.rightMargin: Style.space(10)
+              anchors.verticalCenter: parent.verticalCenter
+              spacing: Style.space(8)
+
+              // Expand / Collapse All Pill
+              Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                height: Style.space(24)
+                width: expandAllText.implicitWidth + Style.space(14)
+                radius: Style.space(12)
+                color: expandAllMouse.containsMouse ? Qt.rgba(1, 1, 1, 0.12) : Qt.rgba(1, 1, 1, 0.05)
+                border.width: 1
+                border.color: Qt.darker(root.bar.foreground, 1.8)
+
+                Row {
+                  id: expandAllText
+                  anchors.centerIn: parent
+                  spacing: Style.space(4)
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.allRoomsExpanded ? "󰅂" : "󰅀"
+                    color: Qt.darker(root.bar.foreground, 1.3)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.allRoomsExpanded ? "Collapse all" : "Expand all"
+                    color: Qt.darker(root.bar.foreground, 1.3)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                MouseArea {
+                  id: expandAllMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.toggleAllExpanded()
+                }
+              }
+
+              ToggleSwitch {
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.allLightsOn
+                foreground: root.bar.foreground
+                accent: Color.accent
+                onToggled: root.toggleAll(!root.allLightsOn)
+              }
+            }
           }
 
           Column {
             visible: root.config !== null && root.roomCount > 0
             width: parent.width
-            spacing: Style.space(4)
+            spacing: Style.space(6)
 
             Repeater {
               model: root.roomsWithLights
@@ -613,64 +750,409 @@ Panel {
                 id: roomColumn
                 required property var modelData
                 width: parent.width
-                spacing: Style.space(2)
+                spacing: Style.space(4)
 
-                Toggle {
-                  width: parent.width
-                  label: modelData.name + " (" + modelData.lightCount + ")"
-                  checked: modelData.on
-                  foreground: root.bar.foreground
-                  accent: Color.accent
-                  fontFamily: root.bar.fontFamily
-                  onClicked: root.toggleRoom(modelData.id, !modelData.on)
-                }
+                readonly property bool isExpanded: root.isRoomExpanded(modelData.id)
+                readonly property bool themeSynced: root.roomSyncOn(modelData.id)
 
-                Toggle {
-                  visible: modelData.on
+                // --- Room Header Card ---
+                BorderSurface {
                   width: parent.width
-                  label: "Theme Sync"
-                  checked: root.themeSync[modelData.id] !== false
-                  foreground: root.bar.foreground
-                  accent: Color.accent
-                  fontFamily: root.bar.fontFamily
-                  onClicked: {
-                    var ts = JSON.parse(JSON.stringify(root.themeSync))
-                    ts[modelData.id] = ts[modelData.id] === false
-                    root.themeSync = ts
-                    actionProc.command = HueApi.apiCmd(["write-theme-config", JSON.stringify(ts)])
-                    actionProc.running = true
+                  implicitHeight: Style.space(44)
+                  radius: Style.cornerRadius
+                  color: Style.controlFill(false, roomHeaderMouse.containsMouse, root.bar.foreground, Color.accent)
+                  borderSpec: Border.controlSpec(roomHeaderMouse.containsMouse ? "hover-cursor" : "normal", root.bar.foreground, Color.accent)
+
+                  MouseArea {
+                    id: roomHeaderMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleRoomExpanded(roomColumn.modelData.id)
+                  }
+
+                  Row {
+                    anchors.left: parent.left
+                    anchors.leftMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: roomColumn.isExpanded ? "󰅀" : "󰅂"
+                      color: Qt.darker(root.bar.foreground, 1.3)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.body
+                    }
+
+                    Column {
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: 1
+
+                      Text {
+                        text: modelData.name
+                        color: modelData.on ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.5)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                      }
+
+                      Text {
+                        text: modelData.lightCount + (modelData.lightCount === 1 ? " light" : " lights")
+                        color: Qt.darker(root.bar.foreground, 1.6)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+                    }
+                  }
+
+                  Row {
+                    anchors.right: parent.right
+                    anchors.rightMargin: Style.space(10)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(8)
+
+                    // Theme Sync Pill Button
+                    Rectangle {
+                      visible: modelData.on
+                      anchors.verticalCenter: parent.verticalCenter
+                      height: Style.space(22)
+                      width: syncText.implicitWidth + Style.space(14)
+                      radius: Style.space(11)
+                      color: roomColumn.themeSynced ? Util.alpha(Color.accent, 0.25) : Qt.rgba(1, 1, 1, 0.06)
+                      border.width: 1
+                      border.color: roomColumn.themeSynced ? Color.accent : Qt.darker(root.bar.foreground, 1.8)
+
+                      Row {
+                        id: syncText
+                        anchors.centerIn: parent
+                        spacing: Style.space(3)
+
+                        Text {
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: "󰚌"
+                          color: roomColumn.themeSynced ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
+                          font.family: root.bar.fontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+
+                        Text {
+                          anchors.verticalCenter: parent.verticalCenter
+                          text: "Sync"
+                          color: roomColumn.themeSynced ? Color.accent : Qt.darker(root.bar.foreground, 1.4)
+                          font.family: root.bar.fontFamily
+                          font.pixelSize: Style.font.caption
+                          font.bold: roomColumn.themeSynced
+                        }
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                          var ts = JSON.parse(JSON.stringify(root.themeSync))
+                          ts[roomColumn.modelData.id] = !roomColumn.themeSynced
+                          root.themeSync = ts
+                          actionProc.command = HueApi.apiCmd(["write-theme-config", JSON.stringify(ts)])
+                          actionProc.running = true
+                        }
+                      }
+                    }
+
+                    // Room Master Switch
+                    ToggleSwitch {
+                      anchors.verticalCenter: parent.verticalCenter
+                      checked: modelData.on
+                      foreground: root.bar.foreground
+                      accent: Color.accent
+                      onToggled: root.toggleRoom(modelData.id, !modelData.on)
+                    }
                   }
                 }
 
-                Repeater {
-                  model: modelData.lights
+                // --- Nested Lights List ---
+                Column {
+                  visible: roomColumn.isExpanded
+                  width: parent.width
+                  spacing: Style.space(4)
 
-                  Column {
-                    id: roomLightRow
-                    required property var modelData
-                    readonly property bool themeSynced: root.roomSyncOn(roomColumn.modelData.id)
-                    width: parent.width
-                    spacing: Style.space(1)
+                  Repeater {
+                    model: modelData.lights
 
-                    Toggle {
+                    BorderSurface {
+                      id: lightCard
+                      required property var modelData
                       width: parent.width
-                      label: modelData.name
-                      titleSize: Style.font.body
-                      checked: modelData.on
-                      foreground: Qt.darker(root.bar.foreground, 1.2)
-                      accent: Color.accent
-                      fontFamily: root.bar.fontFamily
-                      onClicked: root.toggleLight(modelData.id, !modelData.on)
+                      implicitHeight: lightCol.implicitHeight + Style.space(8)
+                      radius: Style.cornerRadius
+                      color: Qt.rgba(0, 0, 0, 0.22)
+                      borderSpec: Border.controlSpec("normal", Qt.darker(root.bar.foreground, 1.9), Color.accent)
+
+                      Column {
+                        id: lightCol
+                        anchors.left: parent.left
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        anchors.margins: Style.space(6)
+                        spacing: Style.space(4)
+
+                        // Main Inline Row: Icon + Name + Brightness Slider + HSV Icon + Switch
+                        Item {
+                          width: parent.width
+                          implicitHeight: Style.space(30)
+
+                          // Left: Icon + Name
+                          Row {
+                            id: lightInfo
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(6)
+                            width: Style.space(135)
+
+                            Text {
+                              anchors.verticalCenter: parent.verticalCenter
+                              text: "󰌵"
+                              color: modelData.on ? Color.accent : Qt.darker(root.bar.foreground, 2.0)
+                              font.family: root.bar.fontFamily
+                              font.pixelSize: Style.font.body
+                            }
+
+                            Text {
+                              anchors.verticalCenter: parent.verticalCenter
+                              width: parent.width - Style.space(22)
+                              text: modelData.name
+                              color: modelData.on ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.6)
+                              font.family: root.bar.fontFamily
+                              font.pixelSize: Style.font.body
+                              elide: Text.ElideRight
+                            }
+                          }
+
+                          // Middle: Brightness Slider + Percentage (when on)
+                          Row {
+                            visible: modelData.on && modelData.hasBri
+                            anchors.left: lightInfo.right
+                            anchors.right: lightControlsRow.left
+                            anchors.leftMargin: Style.space(6)
+                            anchors.rightMargin: Style.space(6)
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(4)
+
+                            Text {
+                              anchors.verticalCenter: parent.verticalCenter
+                              text: "󰃟"
+                              color: Qt.darker(root.bar.foreground, 1.5)
+                              font.family: root.bar.fontFamily
+                              font.pixelSize: Style.font.caption
+                            }
+
+                            HueSlider {
+                              anchors.verticalCenter: parent.verticalCenter
+                              width: parent.width - Style.space(48)
+                              bar: root.bar
+                              minimum: 1
+                              maximum: 254
+                              integer: true
+                              step: 10
+                              value: modelData.bri
+                              onReleased: function(v) { root.setBrightness(modelData.id, v) }
+                            }
+
+                            Text {
+                              anchors.verticalCenter: parent.verticalCenter
+                              width: Style.space(28)
+                              text: Math.round((modelData.bri / 254) * 100) + "%"
+                              color: Qt.darker(root.bar.foreground, 1.4)
+                              font.family: root.bar.fontFamily
+                              font.pixelSize: Style.font.caption
+                              horizontalAlignment: Text.AlignRight
+                              font.bold: true
+                            }
+                          }
+
+                          // Right: HSV Color Wheel Icon + ToggleSwitch
+                          Row {
+                            id: lightControlsRow
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: Style.space(8)
+
+                            Item {
+                              visible: modelData.on && modelData.hasColor && !roomColumn.themeSynced
+                              anchors.verticalCenter: parent.verticalCenter
+                              width: Style.space(20)
+                              height: Style.space(20)
+
+                              Image {
+                                anchors.fill: parent
+                                source: Qt.resolvedUrl("hsv_wheel.png")
+                                fillMode: Image.Stretch
+                                smooth: true
+                              }
+
+                              Rectangle {
+                                anchors.fill: parent
+                                radius: Style.space(10)
+                                border.width: modelData.pickerOpen ? 2 : 1
+                                border.color: modelData.pickerOpen ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
+                                color: "transparent"
+                              }
+
+                              MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.toggleColorPicker(modelData.id)
+                              }
+                            }
+
+                            ToggleSwitch {
+                              anchors.verticalCenter: parent.verticalCenter
+                              checked: modelData.on
+                              foreground: root.bar.foreground
+                              accent: Color.accent
+                              onToggled: root.toggleLight(modelData.id, !modelData.on)
+                            }
+                          }
+                        }
+
+                        // Color Temperature Row (compact, when supported)
+                        Row {
+                          visible: modelData.on && modelData.hasCt && !roomColumn.themeSynced
+                          width: parent.width
+                          anchors.leftMargin: Style.space(140)
+                          spacing: Style.space(6)
+
+                          Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "󰃠"
+                            color: Qt.darker(root.bar.foreground, 1.5)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                          }
+
+                          HueSlider {
+                            width: parent.width - Style.space(200)
+                            anchors.verticalCenter: parent.verticalCenter
+                            bar: root.bar
+                            minimum: 153
+                            maximum: 500
+                            integer: true
+                            step: 10
+                            value: modelData.ct
+                            onReleased: function(v) { root.setColorTemperature(modelData.id, v) }
+                          }
+
+                          Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Temp"
+                            color: Qt.darker(root.bar.foreground, 1.6)
+                            font.family: root.bar.fontFamily
+                            font.pixelSize: Style.font.caption
+                          }
+                        }
+
+                        // Color Wheel (expands below when pickerOpen)
+                        ColorWheel {
+                          lightOn: modelData.on
+                          hasColor: modelData.hasColor
+                          pickerOpen: modelData.pickerOpen
+                          themeSynced: roomColumn.themeSynced
+                          initialHue: modelData.hue
+                          initialSat: modelData.sat
+                          onColorSelected: function(hue, sat) { root.setLightColor(modelData.id, hue, sat) }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          Column {
+            visible: root.config !== null && root.orphanLights.length > 0
+            width: parent.width
+            spacing: Style.space(4)
+
+            Text {
+              text: "OTHER LIGHTS"
+              color: Qt.darker(root.bar.foreground, 1.4)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              font.letterSpacing: 1
+              font.bold: true
+            }
+
+            Repeater {
+              model: root.orphanLights
+
+              BorderSurface {
+                id: orphanCard
+                required property var modelData
+                width: parent.width
+                implicitHeight: orphanCol.implicitHeight + Style.space(8)
+                radius: Style.cornerRadius
+                color: Qt.rgba(0, 0, 0, 0.22)
+                borderSpec: Border.controlSpec("normal", Qt.darker(root.bar.foreground, 1.9), Color.accent)
+
+                Column {
+                  id: orphanCol
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.top: parent.top
+                  anchors.margins: Style.space(6)
+                  spacing: Style.space(4)
+
+                  Item {
+                    width: parent.width
+                    implicitHeight: Style.space(30)
+
+                    Row {
+                      id: orphanInfo
+                      anchors.left: parent.left
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(6)
+                      width: Style.space(135)
+
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "󰌵"
+                        color: modelData.on ? Color.accent : Qt.darker(root.bar.foreground, 2.0)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.body
+                      }
+
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Style.space(22)
+                        text: modelData.name
+                        color: modelData.on ? root.bar.foreground : Qt.darker(root.bar.foreground, 1.6)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.body
+                        elide: Text.ElideRight
+                      }
                     }
 
                     Row {
-                      visible: modelData.on && modelData.hasColor
-                      width: parent.width - Style.space(24)
-                      anchors.horizontalCenter: parent.horizontalCenter
-                      spacing: Style.space(8)
+                      visible: modelData.on && modelData.hasBri
+                      anchors.left: orphanInfo.right
+                      anchors.right: orphanControlsRow.left
+                      anchors.leftMargin: Style.space(6)
+                      anchors.rightMargin: Style.space(6)
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(4)
 
-                      PanelSlider {
-                        width: roomLightRow.themeSynced ? parent.width : parent.width - Style.space(30)
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: "󰃟"
+                        color: Qt.darker(root.bar.foreground, 1.5)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      HueSlider {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width - Style.space(48)
                         bar: root.bar
                         minimum: 1
                         maximum: 254
@@ -680,10 +1162,29 @@ Panel {
                         onReleased: function(v) { root.setBrightness(modelData.id, v) }
                       }
 
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Style.space(28)
+                        text: Math.round((modelData.bri / 254) * 100) + "%"
+                        color: Qt.darker(root.bar.foreground, 1.4)
+                        font.family: root.bar.fontFamily
+                        font.pixelSize: Style.font.caption
+                        horizontalAlignment: Text.AlignRight
+                        font.bold: true
+                      }
+                    }
+
+                    Row {
+                      id: orphanControlsRow
+                      anchors.right: parent.right
+                      anchors.verticalCenter: parent.verticalCenter
+                      spacing: Style.space(8)
+
                       Item {
-                        visible: !roomLightRow.themeSynced
-                        width: Style.space(22)
-                        height: Style.space(22)
+                        visible: modelData.on && modelData.hasColor
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Style.space(20)
+                        height: Style.space(20)
 
                         Image {
                           anchors.fill: parent
@@ -694,7 +1195,7 @@ Panel {
 
                         Rectangle {
                           anchors.fill: parent
-                          radius: Style.space(11)
+                          radius: Style.space(10)
                           border.width: modelData.pickerOpen ? 2 : 1
                           border.color: modelData.pickerOpen ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
                           color: "transparent"
@@ -706,22 +1207,34 @@ Panel {
                           onClicked: root.toggleColorPicker(modelData.id)
                         }
                       }
+
+                      ToggleSwitch {
+                        anchors.verticalCenter: parent.verticalCenter
+                        checked: modelData.on
+                        foreground: root.bar.foreground
+                        accent: Color.accent
+                        onToggled: root.toggleLight(modelData.id, !modelData.on)
+                      }
+                    }
+                  }
+
+                  Row {
+                    visible: modelData.on && modelData.hasCt
+                    width: parent.width
+                    anchors.leftMargin: Style.space(140)
+                    spacing: Style.space(6)
+
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "󰃠"
+                      color: Qt.darker(root.bar.foreground, 1.5)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
                     }
 
-                    ColorWheel {
-                      lightOn: modelData.on
-                      hasColor: modelData.hasColor
-                      pickerOpen: modelData.pickerOpen
-                      themeSynced: roomLightRow.themeSynced
-                      initialHue: modelData.hue
-                      initialSat: modelData.sat
-                      onColorSelected: function(hue, sat) { root.setLightColor(modelData.id, hue, sat) }
-                    }
-
-                    PanelSlider {
-                      visible: modelData.on && modelData.hasCt && !roomLightRow.themeSynced
-                      width: parent.width - Style.space(24)
-                      anchors.horizontalCenter: parent.horizontalCenter
+                    HueSlider {
+                      width: parent.width - Style.space(200)
+                      anchors.verticalCenter: parent.verticalCenter
                       bar: root.bar
                       minimum: 153
                       maximum: 500
@@ -730,123 +1243,24 @@ Panel {
                       value: modelData.ct
                       onReleased: function(v) { root.setColorTemperature(modelData.id, v) }
                     }
-                  }
-                }
-              }
-            }
-          }
 
-          Column {
-            visible: root.config !== null && root.orphanLights.length > 0
-            width: parent.width
-            spacing: Style.space(2)
-
-            Text {
-              text: "Other lights"
-              color: Qt.darker(root.bar.foreground, 1.4)
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              font.letterSpacing: 1
-              font.bold: true
-            }
-
-            Repeater {
-              model: root.orphanLights
-
-              Column {
-                id: orphanLightRow
-                required property var modelData
-                width: parent.width
-                spacing: Style.space(2)
-
-                Toggle {
-                  width: parent.width
-                  label: modelData.name
-                  titleSize: Style.font.body
-                  checked: modelData.on
-                  foreground: Qt.darker(root.bar.foreground, 1.2)
-                  accent: Color.accent
-                  fontFamily: root.bar.fontFamily
-                  onClicked: root.toggleLight(modelData.id, !modelData.on)
-                }
-
-                PanelSlider {
-                  visible: modelData.on && modelData.hasBri
-                  width: parent.width - Style.space(24)
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  bar: root.bar
-                  minimum: 1
-                  maximum: 254
-                  integer: true
-                  step: 10
-                  value: modelData.bri
-                  onReleased: function(v) { root.setBrightness(modelData.id, v) }
-                }
-
-                Row {
-                  visible: modelData.on && modelData.hasColor
-                  width: parent.width - Style.space(24)
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  spacing: Style.space(8)
-
-                  PanelSlider {
-                    width: parent.width - Style.space(30)
-                    bar: root.bar
-                    minimum: 1
-                    maximum: 254
-                    integer: true
-                    step: 10
-                    value: modelData.bri
-                    onReleased: function(v) { root.setBrightness(modelData.id, v) }
-                  }
-
-                  Item {
-                    width: Style.space(22)
-                    height: Style.space(22)
-
-                    Image {
-                      anchors.fill: parent
-                      source: Qt.resolvedUrl("hsv_wheel.png")
-                      fillMode: Image.Stretch
-                      smooth: true
-                    }
-
-                    Rectangle {
-                      anchors.fill: parent
-                      radius: Style.space(11)
-                      border.width: modelData.pickerOpen ? 2 : 1
-                      border.color: modelData.pickerOpen ? Color.accent : Qt.darker(root.bar.foreground, 1.6)
-                      color: "transparent"
-                    }
-
-                    MouseArea {
-                      anchors.fill: parent
-                      cursorShape: Qt.PointingHandCursor
-                      onClicked: root.toggleColorPicker(modelData.id)
+                    Text {
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: "Temp"
+                      color: Qt.darker(root.bar.foreground, 1.6)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
                     }
                   }
-                }
 
-                ColorWheel {
-                  lightOn: modelData.on
-                  hasColor: modelData.hasColor
-                  pickerOpen: modelData.pickerOpen
-                  initialHue: modelData.hue
-                  initialSat: modelData.sat
-                  onColorSelected: function(hue, sat) { root.setLightColor(modelData.id, hue, sat) }
-                }
-
-                PanelSlider {
-                  visible: modelData.on && modelData.hasCt
-                  width: parent.width - Style.space(24)
-                  anchors.horizontalCenter: parent.horizontalCenter
-                  bar: root.bar
-                  minimum: 153
-                  maximum: 500
-                  integer: true
-                  step: 10
-                  value: modelData.ct
-                  onReleased: function(v) { root.setColorTemperature(modelData.id, v) }
+                  ColorWheel {
+                    lightOn: modelData.on
+                    hasColor: modelData.hasColor
+                    pickerOpen: modelData.pickerOpen
+                    initialHue: modelData.hue
+                    initialSat: modelData.sat
+                    onColorSelected: function(hue, sat) { root.setLightColor(modelData.id, hue, sat) }
+                  }
                 }
               }
             }

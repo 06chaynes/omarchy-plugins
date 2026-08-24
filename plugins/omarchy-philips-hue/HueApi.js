@@ -80,7 +80,7 @@ function parseGroups(text) {
     if (!Object.prototype.hasOwnProperty.call(obj, id)) continue
     var group = obj[id]
     var type = String(group.type || "")
-    if (type !== "Room" && type !== "Zone") continue
+    if (type !== "Room") continue
     groups.push({
       id: String(id),
       name: String(group.name || "Group " + id),

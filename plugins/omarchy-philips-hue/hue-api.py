@@ -171,6 +171,16 @@ def _write_theme_config(ts_json):
         json.dump(cfg, f, indent=2)
         f.write('\n')
 
+    # Trigger theme sync hook immediately so newly enabled rooms update
+    hook_path = os.path.join(
+        os.path.expanduser("~"), ".config/omarchy/hooks/theme-set.d/45-hue.sh")
+    if os.path.isfile(hook_path) and os.access(hook_path, os.X_OK):
+        import subprocess
+        try:
+            subprocess.Popen(["bash", hook_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     try:
