@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clipbasket.com/omarchy/settings.schema.json",
+  "title": "Clipbasket for Omarchy settings",
+  "description": "The settings contract for Clipbasket on Omarchy. Persisted to $XDG_CONFIG_HOME/clipbasket/settings.json (default ~/.config/clipbasket/settings.json). Seed it with `clipbasket-omarchy settings-init`, which derives the defaults below so they live in exactly one place. Any key absent from the file falls back to its default here; unknown keys are preserved untouched so a downgrade never destroys a newer install's settings.",
+  "type": "object",
+  "additionalProperties": true,
+
+  "x-clipbasket": {
+    "settingsPath": "~/.config/clipbasket/settings.json",
+    "databasePath": "~/.local/state/clipbasket/clips.db",
+    "groups": [
+      { "id": "general",  "title": "General",  "properties": ["globalShortcut"] },
+      { "id": "history",  "title": "History",  "properties": ["maxClips", "ignoreConfidentialCopies"] },
+      { "id": "behavior", "title": "Behavior", "properties": ["closePanelAfterAction", "pasteSelectedClipImmediately"] }
+    ],
+    "notInThisPort": [
+      {
+        "name": "theme",
+        "reason": "Omarchy owns theming. The panel is built from Omarchy's own Style tokens and follows the active theme; an app-level override would fight it."
+      },
+      {
+        "name": "automaticallyCheckForUpdates",
+        "reason": "git and pacman own updates here. `git -C ~/.config/omarchy/plugins/clipbasket.clipboard pull` is the update mechanism; there is nothing for the app to check."
+      },
+      {
+        "name": "pastePermission (macOS Accessibility)",
+        "reason": "Wayland has no equivalent grant. Synthetic input goes through wtype/ydotool, which either work or are not installed."
+      },
+      {
+        "name": "openAtCursorOnShortcut",
+        "reason": "Nothing could consume it. The popup is a layer-shell surface anchored to the bar pill by Omarchy’s own Panel chrome, which positions it relative to the widget rather than the pointer; there is no supported way for the plugin to place it at the cursor, so the setting only ever described an intention."
+      },
+      {
+        "name": "launchAtLogin",
+        "reason": "The shell starts capture; there is nothing to opt out of. Service.qml owns the wl-paste watchers, so capture runs exactly when omarchy-shell runs, and dies with it. The setting was inert even before that: nothing read the key it wrote."
+      },
+      {
+        "name": "closePanelAfterCopy",
+        "reason": "The macOS app kept this in lockstep with closePanelAfterSelection through the UI. Collapsed into the single closePanelAfterAction."
+      }
+    ],
+    "validation": [
+      {
+        "rule": "pasteSelectedClipImmediately requires closePanelAfterAction",
+        "message": "Auto-paste requires closing the popup first.",
+        "note": "Ported verbatim from the macOS app's normalize_settings: pasting into the focused window while the panel still holds focus pastes into the panel."
+      }
+    ]
+  },
+
+  "properties": {
+    "globalShortcut": {
+      "type": "string",
+      "default": "",
+      "title": "Global shortcut",
+      "description": "The key that opens Clipbasket. The compositor owns this on Wayland — change it in ~/.config/hypr/bindings.lua, or run `clipbasket-omarchy make-default`.",
+      "readOnly": true,
+      "x-clipbasket": {
+        "group": "general",
+        "managedBy": "compositor",
+        "emptyMeans": "not bound",
+        "help": "Display-only mirror of the managed block in bindings.lua, written by `clipbasket-omarchy make-default` and cleared by `restore-default`. The panel must render it but must never write it: writing here would desynchronise the file that actually decides the binding. It defaults to empty because a fresh install deliberately does not take a key — Omarchy's own clipboard keeps SUPER + CTRL + V until the user asks otherwise.",
+        "source": "~/.config/hypr/bindings.lua, between the `-- >>> clipbasket` and `-- <<< clipbasket` markers",
+        "unboundLabel": "Not bound — Omarchy's clipboard owns SUPER + CTRL + V"
+      }
+    },
+
+    "maxClips": {
+      "type": "integer",
+      "default": 1000,
+      "minimum": 50,
+      "maximum": 100000,
+      "title": "Maximum saved clips",
+      "description": "Most users copy 20-50 items a day. 500 clips is about two weeks, 1000 about a month, 2000 about two months.",
+      "x-clipbasket": {
+        "group": "history",
+        "help": "Values outside the range are clamped rather than rejected, matching the macOS app. Pinned and saved clips are exempt from the prune.",
+        "clampOutOfRange": true
+      }
+    },
+
+    "ignoreConfidentialCopies": {
+      "type": "boolean",
+      "default": true,
+      "title": "Ignore confidential copies",
+      "description": "Never record items marked concealed, like passwords copied from password managers.",
+      "x-clipbasket": {
+        "group": "history",
+        "help": "On Wayland this means skipping offers carrying the x-kde-passwordManagerHint MIME type, and copies made while CLIPBOARD_STATE=sensitive. Defaults on: a privacy default should never need to be discovered.",
+        "wayland": ["x-kde-passwordManagerHint", "CLIPBOARD_STATE=sensitive"]
+      }
+    },
+
+    "closePanelAfterAction": {
+      "type": "boolean",
+      "default": true,
+      "title": "Close popup after action",
+      "description": "Hide the popup after selecting or copying a clip.",
+      "x-clipbasket": {
+        "group": "behavior",
+        "aliases": ["closeAfterAction", "closePanelAfterSelection", "closePanelAfterCopy"],
+        "help": "Turning this off disables auto-paste, which cannot work while the panel still holds focus."
+      }
+    },
+
+    "pasteSelectedClipImmediately": {
+      "type": "boolean",
+      "default": false,
+      "title": "Paste immediately",
+      "description": "After picking a clip, paste it into the focused window instead of only copying it.",
+      "x-clipbasket": {
+        "group": "behavior",
+        "requires": { "closePanelAfterAction": true },
+        "requiresBinaries": ["wtype"],
+        "help": "Wayland has no system-wide synthetic-input API, so this shells out to wtype (or ydotool with a running daemon). The panel should present it as unavailable, not merely off, when neither is installed.",
+        "unavailableLabel": "Install wtype to enable automatic paste"
+      }
+    }
+  }
+}

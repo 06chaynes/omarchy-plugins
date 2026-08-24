@@ -1,0 +1,1547 @@
+#!/usr/bin/env bash
+# clipbasket-capture — the payload `wl-paste --watch` runs on every clipboard
+# change. It classifies the offer, turns it into a clip JSON document, and
+# hands that to clipbasket-db.
+#
+#   wl-paste --type text  --watch clipbasket-capture text
+#   wl-paste --type image --watch clipbasket-capture image
+#
+# `clipbasket-capture --selftest` runs the regression tests against stubbed
+# wl-paste/wl-copy binaries and a scratch database.
+#
+# The clipboard content arrives on stdin; the *offer* (which MIME types the
+# source advertises) is read back with `wl-paste --list-types`, because that is
+# the only way to see the markers a password manager attaches and the only way
+# to tell a file copy from the plain-text rendering of the same paths.
+#
+# Two watchers, not three: which one records a given change is decided here
+# from the offer, so a copy that carries both an image and its alt text is
+# recorded once. Priority matches the Tauri app — files, then image, then text.
+#
+# A web copy also advertises text/html. That is a *flavour*, not a kind: the
+# plain text stays the clip's text so an ordinary paste is unchanged, and the
+# markup rides along in `html` for `clipbasket-db markdown` to convert later.
+
+set -euo pipefail
+
+STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
+IMAGE_DIR="$STATE_DIR/images"
+THUMB_DIR="$STATE_DIR/thumbs"
+SUPPRESS_FILE="$STATE_DIR/suppress"
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+DB_CLI="${CLIPBASKET_DB_CLI:-$SCRIPT_DIR/clipbasket-db}"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
+
+MAX_TEXT_BYTES="${CLIPBASKET_MAX_TEXT_BYTES:-8388608}"    # 8 MiB, as in the Tauri app
+MAX_HTML_BYTES="${CLIPBASKET_MAX_HTML_BYTES:-8388608}"    # CLIPBOARD_HTML_MAX_BYTES
+MAX_IMAGE_BYTES="${CLIPBASKET_MAX_IMAGE_BYTES:-67108864}" # 64 MiB
+MAX_FILE_ITEMS="${CLIPBASKET_MAX_FILE_ITEMS:-1024}"
+# A URI is a path plus a scheme and percent-encoding; 4 KiB each is far more
+# than any real one and keeps a full MAX_FILE_ITEMS list well inside the bound.
+MAX_URI_LIST_BYTES="${CLIPBASKET_MAX_URI_LIST_BYTES:-$((MAX_FILE_ITEMS * 4096 + 1))}"
+# MIME discovery runs before the confidential-offer check on every clipboard
+# change. It is attacker-controlled producer output too, so it needs its own
+# small bound; an oversized/truncated list is rejected as unclassifiable.
+MAX_TYPES_BYTES="${CLIPBASKET_MAX_TYPES_BYTES:-65536}"
+MAX_CLIPS="${CLIPBASKET_MAX_CLIPS:-1000}"
+THUMB_SIZE="${CLIPBASKET_THUMB_SIZE:-224}"
+# CLIPBOARD_IMAGE_MAX_DIMENSION in the desktop app. A guard on *decoded* pixels
+# rather than on the byte count: 64 MiB of PNG can still be a 100000x100000
+# decompression bomb, and the thumbnailer is what would decode it.
+MAX_IMAGE_DIMENSION="${CLIPBASKET_MAX_IMAGE_DIMENSION:-16384}"
+# Honour the password-manager markers on the offer. 1 (the default) skips those
+# clips; 0 records them anyway. The service passes the user's setting through.
+IGNORE_CONFIDENTIAL="${CLIPBASKET_IGNORE_CONFIDENTIAL:-1}"
+
+WL_PASTE_BIN="${CLIPBASKET_WL_PASTE:-wl-paste}"
+
+TMPFILES=()
+cleanup() {
+	if [ "${#TMPFILES[@]}" -gt 0 ]; then
+		rm -f "${TMPFILES[@]}"
+	fi
+}
+
+# EXIT on its own is not enough: a signal with no handler kills bash outright
+# and the EXIT trap never runs, leaving the clipboard payload in $TMPDIR. Each
+# handler cleans up, disarms itself and re-raises.
+on_signal() {
+	cleanup
+	trap - "$1" EXIT
+	kill -s "$1" "$$"
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+log() { printf 'clipbasket-capture: %s\n' "$*" >&2; }
+
+# Predictable-path hardening (marketplace security review, 2026-08-24): never
+# create-and-trust a directory another same-user process could have planted as
+# a symlink; a planted link would redirect captured images and thumbnails.
+ensure_private_dir() {
+	# $1 path, $2 mode for a fresh create
+	local dir="$1" mode="${2:-700}" owner
+	if [ -L "$dir" ]; then
+		log "$dir is a symlink; refusing to write through it"
+		exit 1
+	fi
+	if [ -e "$dir" ]; then
+		if [ ! -d "$dir" ]; then log "$dir exists and is not a directory"; exit 1; fi
+		owner=$(stat -c %u -- "$dir" 2>/dev/null || stat -f %u -- "$dir" 2>/dev/null)
+		if [ "$owner" != "$(id -u)" ]; then log "$dir is not owned by the current user"; exit 1; fi
+		return 0
+	fi
+	mkdir -p -- "$dir" || { log "could not create $dir"; exit 1; }
+	if [ -L "$dir" ]; then log "$dir became a symlink; refusing"; exit 1; fi
+	chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
+# The check above is fast-fail UX, not the security boundary: a pathname test
+# followed later by a `cp` is a check-to-use window a same-user process can
+# race. Real writes go through clipbasket-safefile, which opens every path
+# component O_NOFOLLOW, verifies the descriptor with fstat, and renames
+# relative to it. (Marketplace security review, second round, 2026-08-24.)
+safe_ensure_dir() {
+	local rc=0
+	"$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
+	if [ "$rc" -ne 0 ]; then log "refusing to use $1 (clipbasket-safefile exit $rc)"; exit 1; fi
+}
+
+safe_write() {
+	# $1 dir, $2 name, $3 mode, $4 maximum input bytes. Content on stdin.
+	local rc=0 max="${4:-$MAX_IMAGE_BYTES}"
+	"$SAFEFILE" write "$1" "$2" --mode "${3:-600}" --max-bytes "$max" || rc=$?
+	if [ "$rc" -ne 0 ]; then log "refusing to write $1/$2 (clipbasket-safefile exit $rc)"; return 1; fi
+	return 0
+}
+
+# Exit 2 means "not there", which is the ordinary case for a one-shot token.
+safe_read() {
+	local rc=0
+	"$SAFEFILE" read "$1" "$2" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) log "refusing to read $1/$2 (clipbasket-safefile exit $rc)"; return 1 ;;
+	esac
+}
+
+safe_unlink() {
+	local rc=0
+	"$SAFEFILE" unlink "$1" "$2" || rc=$?
+	[ "$rc" -eq 0 ] || log "could not remove $1/$2 (clipbasket-safefile exit $rc)"
+	return 0
+}
+
+
+# Creates a temp file, records it for cleanup, and leaves the path in
+# REPLY_TMPFILE. Deliberately not a `$(mktempfile)` helper: a command
+# substitution runs in a subshell, so the array it appended to went out of
+# scope with the subshell and cleanup had nothing left to remove.
+REPLY_TMPFILE=''
+mktempfile() {
+	REPLY_TMPFILE=$(mktemp "${TMPDIR:-/tmp}/clipbasket-capture.XXXXXX") || {
+		log "could not create a temp file in ${TMPDIR:-/tmp}"
+		exit 1
+	}
+	TMPFILES[${#TMPFILES[@]}]="$REPLY_TMPFILE"
+}
+
+# --- JSON encoding ---------------------------------------------------------
+
+# Escapes stdin into the *body* of a JSON string (no surrounding quotes).
+# Streams, so an 8 MiB clip never has to live in a shell variable, and encodes
+# every control character rather than dropping it.
+json_escape_stream() {
+	awk '
+		BEGIN { ORS = "" }
+		{
+			if (NR > 1) printf "\\n"
+			s = $0
+			gsub(/\\/, "\\\\", s)
+			gsub(/"/,  "\\\"", s)
+			gsub(/\t/, "\\t",  s)
+			gsub(/\r/, "\\r",  s)
+			gsub(/\010/, "\\b", s)
+			gsub(/\014/, "\\f", s)
+			gsub(/[\001-\037]/, " ", s)
+			printf "%s", s
+		}'
+}
+
+json_string() {
+	printf '"%s"' "$(printf '%s' "${1-}" | json_escape_stream)"
+}
+
+# Emits `"key":value` or `"key":null`, so an absent field is never the empty
+# string masquerading as a value.
+json_field() {
+	if [ -z "${2-}" ]; then
+		printf '%s:null' "$(json_string "$1")"
+	else
+		printf '%s:%s' "$(json_string "$1")" "$(json_string "$2")"
+	fi
+}
+
+json_number_field() {
+	if [ -z "${2-}" ]; then
+		printf '%s:null' "$(json_string "$1")"
+	else
+		printf '%s:%s' "$(json_string "$1")" "$2"
+	fi
+}
+
+# --- helpers ---------------------------------------------------------------
+
+sha256_of() {
+	# $1 kind prefix, $2 file. The kind is folded in so the same bytes offered
+	# as two different kinds cannot collide, matching the Tauri dedupe keys.
+	{
+		printf '%s\n' "$1"
+		cat -- "$2"
+	} | {
+		if command -v sha256sum >/dev/null 2>&1; then
+			sha256sum
+		else
+			shasum -a 256
+		fi
+	} | cut -d' ' -f1
+}
+
+file_size() {
+	wc -c <"$1" | tr -d ' '
+}
+
+# --- guards ----------------------------------------------------------------
+
+# wl-clipboard >= 2.2 sets CLIPBOARD_STATE for the watched command: data, nil,
+# clear, or sensitive. "sensitive" is the Wayland convention for a payload a
+# clipboard manager must not record; the other two non-data states carry
+# nothing worth recording either.
+clipboard_state_is_recordable() {
+	case "${CLIPBOARD_STATE-}" in
+	'' | data) return 0 ;;
+	*)
+		log "skipping clipboard change (CLIPBOARD_STATE=$CLIPBOARD_STATE)"
+		return 1
+		;;
+	esac
+}
+
+# The other half of the same convention: password managers advertise an extra
+# MIME type on the offer rather than setting an env var. x-kde-passwordManagerHint
+# is what KeePassXC, KDE and the GTK password managers use; the nspasteboard.org
+# markers show up on offers bridged from macOS.
+#
+# Every marker is matched case-insensitively: toolkits disagree about the
+# spelling (x-kde-passwordManagerHint, x-kde-passwordmanagerhint,
+# org.nspasteboard.ConcealedType vs ...concealedtype), and a marker that is
+# only recognised in one casing is a password recorded into the history.
+offer_is_confidential() {
+	case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+	*passwordmanagerhint* | *x-kde-password* | \
+		*concealedtype* | *transienttype* | *autogeneratedtype*) return 0 ;;
+	esac
+	return 1
+}
+
+# One-shot self-capture suppression. `clipbasket-db copy` writes the hash of
+# whatever it just put on the clipboard; the echo that comes straight back is
+# swallowed here. The token is cleared whether or not it matched, so a stale
+# one can never hide a later, genuine clipboard change.
+#
+# Called at the last possible moment, immediately before the insert: consuming
+# it earlier meant a capture path that then bailed out had already spent the
+# one-shot token, and whichever watcher recorded the change instead saw no
+# token at all and recorded the echo as a brand new clip.
+consume_suppression() {
+	local want token=''
+	want="$1"
+	# Read and remove through clipbasket-safefile: both are descriptor-relative
+	# and refuse to follow a symlink, so a token planted at this predictable
+	# path can neither leak the hash we are about to read nor redirect the
+	# removal onto something else.
+	#
+	# Read to EOF, not to the first newline: a truncated token silently fails
+	# to match and disarms suppression.
+	token=$(safe_read "$STATE_DIR" suppress) || return 1
+	token=${token%$'\n'}
+	safe_unlink "$STATE_DIR" suppress
+	[ "$token" = "$want" ]
+}
+
+# --- bounded reads ---------------------------------------------------------
+
+# Reads at most $1 bytes of stdin to stdout.
+#
+# Every size limit in this file used to be checked *after* the whole producer
+# stream had been buffered to a temp file, which means the limit protected the
+# database and not us: a clipboard owner offering a gigabyte, or one that never
+# closes the pipe at all, was read in full before being rejected. wl-paste hands
+# us whatever the owning application decides to send, and that application is
+# not ours.
+#
+# Callers pass limit+1, so the existing `-gt LIMIT` tests keep their exact
+# meaning: content of exactly LIMIT bytes reads LIMIT and is accepted, content
+# larger reads LIMIT+1 and is rejected. Nothing bigger than that is ever in
+# memory or on disk.
+#
+# `head -c` also closes its input once satisfied, so the producer gets SIGPIPE
+# and stops rather than being left to stream into a discarded pipe -- which is
+# what makes the never-terminating case terminate.
+bounded_cat() {
+	head -c "$1"
+}
+
+# --- source app ------------------------------------------------------------
+
+# Best effort, and deliberately cheap: whatever window has focus at the moment
+# of the copy. Same approximation the Tauri app makes on macOS and Windows.
+source_app() {
+	command -v hyprctl >/dev/null 2>&1 || return 0
+	# initialClass is supplied by the focused client. Bound before awk sees the
+	# line: bounding after it would still let awk buffer an arbitrarily long one.
+	{ hyprctl activewindow 2>/dev/null |
+		bounded_cat 256 |
+		awk -F': ' '/^[[:space:]]*initialClass: /{ print $2; exit }' |
+		tr -d '\r'; } || true
+}
+
+# --- URL handling ----------------------------------------------------------
+
+# Mirrors detected_url(): a URL clip is a payload that is *entirely* one URL.
+# Anything with whitespace is prose that happens to contain a link, and
+# file:// is a file reference rather than a link.
+is_url() {
+	case "$1" in
+	*[[:space:]]* | '') return 1 ;;
+	file://*) return 1 ;;
+	esac
+	case "$1" in
+	[a-zA-Z]*://?*) return 0 ;;
+	esac
+	return 1
+}
+
+url_domain() {
+	local rest=${1#*://}
+	rest=${rest%%/*}
+	rest=${rest%%\?*}
+	rest=${rest%%#*}
+	rest=${rest##*@}
+	# Leaves an IPv6 literal's brackets alone; strips a trailing :port.
+	case "$rest" in
+	'['*) rest=${rest%%]*}] ;;
+	*) rest=${rest%%:*} ;;
+	esac
+	rest=$(printf '%s' "$rest" | tr 'A-Z' 'a-z')
+	printf '%s' "${rest#www.}"
+}
+
+# domain + path + query, the way the Tauri app renders a link row.
+url_preview() {
+	local url="$1" domain="$2" rest path query
+	rest=${url#*://}
+	rest=${rest%%#*}
+	case "$rest" in
+	*\?*)
+		query=${rest#*\?}
+		rest=${rest%%\?*}
+		;;
+	*) query='' ;;
+	esac
+	case "$rest" in
+	*/*) path=/${rest#*/} ;;
+	*) path='' ;;
+	esac
+	while [ "${path: -1}" = "/" ]; do path=${path%/}; done
+	printf '%s%s' "$domain" "$path"
+	[ -n "$query" ] && printf '?%s' "$query"
+	return 0
+}
+
+# --- file lists ------------------------------------------------------------
+
+# One pass over the byte alphabet, so decoding a %XX escape costs an array
+# lookup instead of a fork.
+URI_BYTE=()
+build_uri_byte_table() {
+	[ "${#URI_BYTE[@]}" -eq 256 ] && return 0
+	local i oct char
+	for ((i = 0; i < 256; i++)); do
+		printf -v oct '%03o' "$i"
+		printf -v char '%b' "\\0$oct"
+		URI_BYTE[i]="$char"
+	done
+}
+
+# Decodes the %XX escapes in a URI path. Only a '%' followed by two hex digits
+# is an escape; anything else is the byte it looks like. The old one-liner
+# rewrote every '%' into a \x and handed the result to printf %b, which turned
+# `100%.txt` into a printf warning plus garbage and `a%2.txt` into a raw 0x02.
+url_decode() {
+	local s="$1" out='' chunk
+	build_uri_byte_table
+	while [ -n "$s" ]; do
+		case "$s" in
+		%[0-9A-Fa-f][0-9A-Fa-f]*)
+			out+="${URI_BYTE[$((16#${s:1:2}))]}"
+			s=${s:3}
+			;;
+		%*)
+			# A bare '%': not an escape, so it stays exactly as it is.
+			out+='%'
+			s=${s:1}
+			;;
+		*)
+			# Everything up to the next '%' copies across in one go.
+			chunk=${s%%%*}
+			out+="$chunk"
+			s=${s:${#chunk}}
+			;;
+		esac
+	done
+	printf '%s' "$out"
+}
+
+# Reads a text/uri-list on stdin and writes one decoded local path per record,
+# NUL-terminated. NUL and not newline: %0A is a legal escape in a uri-list and
+# decodes to a newline inside a file name, which a line-delimited list splits
+# into two bogus paths and miscounts.
+uri_list_paths() {
+	local line path
+	while IFS= read -r line || [ -n "$line" ]; do
+		line=${line%$'\r'}
+		case "$line" in
+		'#'* | '') continue ;;
+		file://*) ;;
+		*) continue ;;
+		esac
+		path=${line#file://}
+		path=${path#*/}     # drop an (empty or otherwise) authority
+		path=$(url_decode "/$path")
+		if [ -n "$path" ]; then
+			printf '%s\0' "$path"
+		fi
+	done
+}
+
+# Counts the NUL-terminated records in $1, into REPLY_COUNT.
+REPLY_COUNT=0
+count_paths() {
+	local path
+	REPLY_COUNT=0
+	while IFS= read -r -d '' path; do
+		REPLY_COUNT=$((REPLY_COUNT + 1))
+	done <"$1"
+}
+
+files_json_from() {
+	# $1 file holding NUL-terminated paths
+	local path name extension first=1
+	printf '['
+	while IFS= read -r -d '' path; do
+		[ -n "$path" ] || continue
+		name=${path##*/}
+		case "$name" in
+		?*.*) extension=$(printf '%s' "${name##*.}" | tr 'A-Z' 'a-z') ;;
+		*) extension='' ;;
+		esac
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{'
+		json_field path "$path"
+		printf ','
+		json_field name "$name"
+		printf ','
+		json_field extension "$extension"
+		printf ',"is_directory":'
+		if [ -d "$path" ]; then printf 'true'; else printf 'false'; fi
+		printf '}'
+	done <"$1"
+	printf ']'
+}
+
+file_list_preview() {
+	# $1 file holding NUL-terminated paths, $2 count
+	local count="$2" first='' second='' seen=0 path
+	while IFS= read -r -d '' path; do
+		seen=$((seen + 1))
+		if [ "$seen" = 1 ]; then
+			first=${path##*/}
+		else
+			second=${path##*/}
+			break
+		fi
+	done <"$1"
+	case "$count" in
+	0) printf 'Files' ;;
+	1) printf '%s' "$first" ;;
+	2) printf '%s, %s' "$first" "$second" ;;
+	*) printf '%s, %s, +%s' "$first" "$second" "$((count - 2))" ;;
+	esac
+}
+
+# --- images ----------------------------------------------------------------
+
+extension_for_mime() {
+	case "$1" in
+	image/png) printf 'png' ;;
+	image/jpeg | image/jpg) printf 'jpg' ;;
+	image/gif) printf 'gif' ;;
+	image/webp) printf 'webp' ;;
+	image/bmp | image/x-bmp | image/x-ms-bmp) printf 'bmp' ;;
+	image/tiff) printf 'tiff' ;;
+	image/svg+xml) printf 'svg' ;;
+	image/avif) printf 'avif' ;;
+	*) printf 'bin' ;;
+	esac
+}
+
+first_image_mime() {
+	printf '%s\n' "$1" | awk '/^image\//{ print; exit }'
+}
+
+magick_cmd() {
+	if command -v magick >/dev/null 2>&1; then
+		printf 'magick'
+	elif command -v convert >/dev/null 2>&1; then
+		printf 'convert'
+	fi
+}
+
+# Prints "WIDTH HEIGHT", or nothing. ImageMagick when it is installed;
+# otherwise the PNG header, which covers what compositors and screenshot tools
+# actually put on a Wayland clipboard.
+image_dimensions() {
+	local file="$1"
+	if command -v magick >/dev/null 2>&1; then
+		# -ping reads the header and stops; without it identify decodes the
+		# whole image, which is exactly what the caller is guarding against.
+		# Resource limits still apply: malformed coders and hostile headers must
+		# not get an unlimited process merely because this is only the probe.
+		magick identify \
+			-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			-ping -format '%w %h' "${file}[0]" 2>/dev/null && return 0
+	elif command -v identify >/dev/null 2>&1; then
+		# ImageMagick 6 exposes identify as a separate binary rather than as the
+		# `magick identify` subcommand.
+		identify \
+			-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			-ping -format '%w %h' "${file}[0]" 2>/dev/null && return 0
+	fi
+	# 89 50 4E 47 = \x89PNG; IHDR width/height are bytes 16..23, big-endian.
+	if [ "$(od -An -tx1 -N4 "$file" | tr -d ' \n')" = "89504e47" ]; then
+		# NF >= 8 and exit: some od builds add a trailing address line, which
+		# a bare `{ ... }` would render as a second "0 0" pair.
+		od -An -tu1 -j16 -N8 "$file" |
+			awk 'NF >= 8 { printf "%d %d", $1*16777216+$2*65536+$3*256+$4, $5*16777216+$6*65536+$7*256+$8; exit }'
+	fi
+}
+
+# Writes a thumbnail of $1 to $2, or leaves $2 absent — QML scales what it is
+# given, so a missing ImageMagick degrades the memory footprint of the grid,
+# not its correctness. The destination is a parameter because the caller stages
+# it under a temporary name and only renames it once the row exists.
+make_thumbnail() {
+	local source="$1" dest="$2"
+	# `png:` states the output format rather than letting ImageMagick infer it
+	# from the extension: the destination is now a staging file in TMPDIR, which
+	# has none, and an inferred format there is a silent failure.
+	if command -v magick >/dev/null 2>&1; then
+		magick -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
+			-background none -alpha background "png:$dest" 2>/dev/null || {
+				rm -f -- "$dest"
+				return 0
+			}
+	elif command -v convert >/dev/null 2>&1; then
+		convert -limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10 \
+			"${source}[0]" -thumbnail "${THUMB_SIZE}x${THUMB_SIZE}>" \
+			-background none -alpha background "png:$dest" 2>/dev/null || {
+				rm -f -- "$dest"
+				return 0
+			}
+	else
+		return 0
+	fi
+	if [ ! -s "$dest" ]; then
+		rm -f -- "$dest"
+	fi
+	return 0
+}
+
+# --- the text/html flavour -------------------------------------------------
+
+# CRLF out, invalid UTF-8 out -- the same two guarantees capture_text makes
+# about the plain text, because everything downstream (JSON, SQLite, QML)
+# assumes valid UTF-8. Reads $1, writes $2.
+normalise_utf8() {
+	if command -v iconv >/dev/null 2>&1; then
+		tr -d '\r' <"$1" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null >"$2"
+	else
+		tr -d '\r' <"$1" >"$2"
+	fi
+}
+
+# Sets REPLY_HTML_FILE to the path of a temp file holding the offer's text/html
+# rendering, or to the empty string. Not a $(...) helper: the temp file it makes
+# has to be registered for cleanup in *this* shell, and a command substitution
+# would register it in a subshell that is gone before the file is even used.
+# HTML is an *extra flavour* on a text clip, never a kind of its own:
+# the plain text stays the clip's `text`, so a normal paste keeps producing the
+# plain text and only "Copy as Markdown" reaches for this. Same split as
+# captured_text_like_clip() on macOS, where html_content rides alongside
+# text_content on a Text or Url clip.
+REPLY_HTML_FILE=''
+read_html_flavor() {
+	local types="$1" mime file clean size
+	REPLY_HTML_FILE=''
+	mime=$(printf '%s\n' "$types" | awk '/^text\/html([;[:space:]]|$)/ { print; exit }')
+	[ -n "$mime" ] || return 0
+
+	mktempfile
+	file="$REPLY_TMPFILE"
+	"$WL_PASTE_BIN" --no-newline --type "$mime" 2>/dev/null |
+		bounded_cat $((MAX_HTML_BYTES + 1)) >"$file" || return 0
+	size=$(file_size "$file")
+	[ "$size" -gt 0 ] || return 0
+	if [ "$size" -gt "$MAX_HTML_BYTES" ]; then
+		log "dropping ${size}-byte html flavour (limit $MAX_HTML_BYTES); keeping the plain text"
+		return 0
+	fi
+
+	mktempfile
+	clean="$REPLY_TMPFILE"
+	normalise_utf8 "$file" "$clean"
+	[ -s "$clean" ] || return 0
+	REPLY_HTML_FILE="$clean"
+}
+
+# --- recording -------------------------------------------------------------
+
+record() {
+	# JSON payload on stdin
+	local out
+	if ! out=$("$DB_CLI" insert); then
+		log "insert failed: $out"
+		return 1
+	fi
+	case "$out" in
+	*'"deduped":true'*) return 0 ;;
+	esac
+	"$DB_CLI" prune --max "$MAX_CLIPS" >/dev/null 2>&1 || true
+}
+
+# Fetches and parses text/uri-list into the NUL-delimited file at $1. The raw
+# producer is staged at limit+1 first so a partial final URI can never be
+# mistaken for a complete, under-limit list. Status 2 means oversized; callers
+# treat that as an offer they own but deliberately drop, never as text/image.
+read_uri_list_paths() {
+	local dest="$1" raw size
+	mktempfile
+	raw="$REPLY_TMPFILE"
+	"$WL_PASTE_BIN" --no-newline --type text/uri-list 2>/dev/null |
+		bounded_cat $((MAX_URI_LIST_BYTES + 1)) >"$raw" || true
+	size=$(file_size "$raw")
+	if [ "$size" -gt "$MAX_URI_LIST_BYTES" ]; then
+		: >"$dest"
+		log "skipping ${size}-byte file list (limit $MAX_URI_LIST_BYTES)"
+		return 2
+	fi
+	uri_list_paths <"$raw" >"$dest"
+}
+
+# True when the offer's text/uri-list resolves to at least one local path.
+# The image watcher's half of the file-copy check: a NUL-delimited list is
+# non-empty exactly when there is a path in it, so no grep is involved.
+offer_is_local_file_list() {
+	local probe status=0
+	mktempfile
+	probe="$REPLY_TMPFILE"
+	read_uri_list_paths "$probe" || status=$?
+	# An oversized list is still conclusively a file-list offer. Claim and drop
+	# it so the image watcher cannot reinterpret a truncated payload as an image.
+	[ "$status" -eq 2 ] && return 0
+	[ -s "$probe" ]
+}
+
+# Status contract, relied on by main():
+#   1  this offer is not a local file list -- fall through to the next kind
+#   0  recorded (or deliberately skipped: this change is ours either way)
+#   2  it *is* a file list and recording it failed -- do NOT fall through
+#
+# The distinction matters: a failed insert used to look exactly like "not a
+# file list", so the text watcher recorded the plain-text rendering of the same
+# paths as a second clip -- with the one-shot suppression token already spent.
+capture_files() {
+	local paths count hash payload preview app mime='' first='' status=0
+	mktempfile
+	paths="$REPLY_TMPFILE"
+	# Bounded before the parse, not after: a hostile uri-list is a stream like
+	# any other. The generous per-path ceiling means a list under the item limit
+	# is never truncated, and one over it is rejected by the count check below.
+	read_uri_list_paths "$paths" || status=$?
+	[ "$status" -eq 2 ] && return 2
+	count_paths "$paths"
+	count="$REPLY_COUNT"
+	[ "$count" -gt 0 ] || return 1
+	if [ "$count" -gt "$MAX_FILE_ITEMS" ]; then
+		log "skipping file list of $count items (limit $MAX_FILE_ITEMS)"
+		return 2
+	fi
+
+	hash=$(sha256_of files "$paths")
+
+	IFS= read -r -d '' first <"$paths" || true
+	if command -v file >/dev/null 2>&1 && [ -n "$first" ] && [ -e "$first" ]; then
+		mime=$(file -b --mime-type -- "$first" 2>/dev/null || printf '')
+	fi
+	preview=$(file_list_preview "$paths" "$count")
+	app=$(source_app)
+
+	mktempfile
+	payload="$REPLY_TMPFILE"
+	{
+		printf '{"kind":"files",'
+		json_field hash "$hash"
+		printf ','
+		json_field preview "$preview"
+		printf ','
+		json_field source_app "$app"
+		printf ','
+		json_field mime "$mime"
+		printf ',"file_count":%s,"files":' "$count"
+		files_json_from "$paths"
+		printf '}'
+	} >"$payload"
+
+	# Last thing before the insert: past here we are the recorder, so spending
+	# the one-shot token cannot strand another watcher.
+	if consume_suppression "$hash"; then
+		return 0
+	fi
+	record <"$payload" || return 2
+	return 0
+}
+
+capture_image() {
+	local stdin_file="$1" types="$2" mime extension hash target thumb dims width='' height='' size app payload preview
+	local staged='' staged_thumb='' source_file thumb_target
+
+	size=$(file_size "$stdin_file")
+	[ "$size" -gt 0 ] || return 1
+	if [ "$size" -gt "$MAX_IMAGE_BYTES" ]; then
+		log "skipping ${size}-byte image (limit $MAX_IMAGE_BYTES)"
+		return 0
+	fi
+
+	mime=$(first_image_mime "$types")
+	[ -n "$mime" ] || mime=image/png
+	extension=$(extension_for_mime "$mime")
+
+	# Content-addressed: the same screenshot copied twice is one file on disk
+	# and one dedupe key, without ever decoding the pixels.
+	hash=$(sha256_of image "$stdin_file")
+
+	safe_ensure_dir "$STATE_DIR" 700
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
+	target="$IMAGE_DIR/$hash.$extension"
+	# Staged in TMPDIR and published only once the row exists: a failed insert
+	# must not leave an orphan in images/ that nothing references, and a partial
+	# file must never exist at the content-addressed name. The publish at the
+	# end is a descriptor-relative atomic rename inside the verified directory,
+	# not a `mv` onto a pathname that could have been re-pointed since.
+	# `-f` follows symlinks, so a link planted at the content-addressed name
+	# read as "already present" and skipped the write entirely -- the row was
+	# then recorded pointing at whatever the attacker had linked to, with
+	# nothing refused and nothing logged. `-L` makes the reuse decision
+	# non-following: anything that is not a real file here goes down the write
+	# path, where clipbasket-safefile refuses it.
+	staged=''
+	if [ ! -f "$target" ] || [ -L "$target" ]; then
+		mktempfile
+		staged="$REPLY_TMPFILE"
+		if ! cp -- "$stdin_file" "$staged"; then
+			rm -f -- "$staged"
+			staged=''
+			log "could not stage $target"
+			return 2
+		fi
+	fi
+	source_file="$target"
+	[ -z "$staged" ] || source_file="$staged"
+
+	dims=$(image_dimensions "$source_file" || printf '')
+	if [ -n "$dims" ]; then
+		width=${dims%% *}
+		height=${dims##* }
+	fi
+	case "$width" in '' | *[!0-9]*) width='' ;; esac
+	case "$height" in '' | *[!0-9]*) height='' ;; esac
+	if { [ -n "$width" ] && [ "$width" -eq 0 ]; } ||
+		{ [ -n "$height" ] && [ "$height" -eq 0 ]; }; then
+		width=''
+		height=''
+	fi
+
+	# The decoded-pixel guard, mirroring CLIPBOARD_IMAGE_MAX_DIMENSION in the
+	# desktop app. Dimensions come from the header (-ping / the PNG IHDR), so
+	# this costs nothing -- and it runs *before* the thumbnail, which is the
+	# step that would actually decode a 16384x16384 decompression bomb.
+	if [ -n "$width" ] && [ -n "$height" ] &&
+		{ [ "$width" -gt "$MAX_IMAGE_DIMENSION" ] || [ "$height" -gt "$MAX_IMAGE_DIMENSION" ]; }; then
+		log "skipping ${width}x${height} image (limit ${MAX_IMAGE_DIMENSION}px a side)"
+		[ -z "$staged" ] || rm -f -- "$staged"
+		return 2
+	fi
+
+	# The thumbnail is content-addressed on the same hash, so it is staged and
+	# renamed with the image for exactly the same reason. Unknown dimensions are
+	# a fail-closed thumbnail decision: never full-decode what the header probe
+	# could not size. The original remains a valid, copyable clip.
+	thumb_target="$THUMB_DIR/$hash.png"
+	staged_thumb=''
+	if [ -z "$width" ] || [ -z "$height" ]; then
+		thumb="$target"
+	# Same non-following reuse test as the image above, for the same reason.
+	elif [ -f "$thumb_target" ] && [ ! -L "$thumb_target" ]; then
+		thumb="$thumb_target"
+	else
+		mktempfile
+		staged_thumb="$REPLY_TMPFILE"
+		make_thumbnail "$source_file" "$staged_thumb"
+		if [ -s "$staged_thumb" ]; then
+			thumb="$thumb_target"
+		else
+			rm -f -- "$staged_thumb"
+			staged_thumb=''
+			thumb="$target"
+		fi
+	fi
+
+	if [ -n "$width" ] && [ -n "$height" ]; then
+		preview="Image ${width}x${height}"
+	else
+		preview="Image"
+	fi
+	app=$(source_app)
+
+	mktempfile
+	payload="$REPLY_TMPFILE"
+	{
+		printf '{"kind":"image",'
+		json_field hash "$hash"
+		printf ','
+		json_field preview "$preview"
+		printf ','
+		json_field source_app "$app"
+		printf ','
+		json_field image_path "$target"
+		printf ','
+		json_field thumb_path "$thumb"
+		printf ','
+		json_field mime "$mime"
+		printf ','
+		json_number_field image_width "$width"
+		printf ','
+		json_number_field image_height "$height"
+		printf ','
+		json_number_field size_bytes "$size"
+		printf '}'
+	} >"$payload"
+
+	# Consume the token, then commit: the staged files become the real ones
+	# only once a row actually references them.
+	if consume_suppression "$hash"; then
+		[ -z "$staged" ] || rm -f -- "$staged"
+		[ -z "$staged_thumb" ] || rm -f -- "$staged_thumb"
+		return 0
+	fi
+	if ! record <"$payload"; then
+		[ -z "$staged" ] || rm -f -- "$staged"
+		[ -z "$staged_thumb" ] || rm -f -- "$staged_thumb"
+		return 2
+	fi
+	# Publish. Both go through the helper, so the bytes land in the directory
+	# whose descriptor was verified rather than at a name that merely looked
+	# right a moment ago.
+	if [ -n "$staged" ] && ! safe_write "$IMAGE_DIR" "$hash.$extension" 644 "$MAX_IMAGE_BYTES" <"$staged"; then
+		return 2
+	fi
+	if [ -n "$staged_thumb" ]; then
+		safe_write "$THUMB_DIR" "$hash.png" 644 "$MAX_IMAGE_BYTES" <"$staged_thumb" || true
+	fi
+	return 0
+}
+
+capture_text() {
+	local stdin_file="$1" types="${2-}"
+	local size text_file html_file='' hash app payload kind=text domain='' preview='' head_line
+
+	size=$(file_size "$stdin_file")
+	[ "$size" -gt 0 ] || return 1
+	if [ "$size" -gt "$MAX_TEXT_BYTES" ]; then
+		log "skipping ${size}-byte text clip (limit $MAX_TEXT_BYTES)"
+		return 0
+	fi
+
+	# Normalise the way the Tauri app does — CRLF to LF, then trim — and make
+	# sure what lands in the database is valid UTF-8, because everything
+	# downstream (JSON, FTS, QML) assumes it is.
+	mktempfile
+	text_file="$REPLY_TMPFILE"
+	if command -v iconv >/dev/null 2>&1; then
+		tr -d '\r' <"$stdin_file" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null |
+			awk 'BEGIN { blank = "" }
+			     { if (seen) printf "%s", blank; if ($0 ~ /^[[:space:]]*$/ && !seen) next;
+			       printf "%s", $0; seen = 1; blank = "\n" }' >"$text_file"
+	else
+		tr -d '\r' <"$stdin_file" >"$text_file"
+	fi
+	# Trim trailing whitespace-only content.
+	if [ ! -s "$text_file" ]; then
+		return 1
+	fi
+
+	head_line=$(head -c 8192 "$text_file" | head -1)
+	if [ "$(file_size "$text_file")" -le 8192 ] && is_url "$head_line" &&
+		[ "$(wc -l <"$text_file" | tr -d ' ')" -eq 0 ]; then
+		kind=url
+		domain=$(url_domain "$head_line")
+		preview=$(url_preview "$head_line" "$domain")
+	fi
+
+	# The dedupe hash covers the plain text only. Two copies of the same words
+	# are the same clip whether or not the second one carried markup, which is
+	# the same key the Tauri app builds.
+	hash=$(sha256_of "$kind" "$text_file")
+	app=$(source_app)
+	read_html_flavor "$types"
+	html_file="$REPLY_HTML_FILE"
+
+	mktempfile
+	payload="$REPLY_TMPFILE"
+	{
+		printf '{'
+		json_field kind "$kind"
+		printf ','
+		json_field hash "$hash"
+		printf ','
+		json_field source_app "$app"
+		printf ','
+		json_field url_domain "$domain"
+		printf ',"url_title":null,'
+		# preview is left null for plain text on purpose: clipbasket-db derives
+		# it in SQL, where substr() counts characters rather than bytes and so
+		# cannot cut a multi-byte character in half.
+		json_field preview "$preview"
+		printf ','
+		if [ -n "$html_file" ]; then
+			printf '"html":"'
+			json_escape_stream <"$html_file"
+			printf '",'
+		fi
+		printf '"text":"'
+		json_escape_stream <"$text_file"
+		printf '"}'
+	} >"$payload"
+
+	if consume_suppression "$hash"; then
+		return 0
+	fi
+	record <"$payload"
+}
+
+# --- selftest --------------------------------------------------------------
+
+# Everything below runs against stubs: a fake wl-paste that serves fixture
+# files, a fake wl-copy, and a real clipbasket-db pointed at a scratch state
+# directory. Nothing here touches a Wayland session or the user's history.
+cmd_selftest() {
+	local pass=0 fail=0
+
+	# Resolved with -P: on macOS $TMPDIR sits under /var, which is a symlink,
+	# and clipbasket-safefile refuses to walk through one -- correctly. Harness
+	# fix only; the rule the helper enforces is unchanged.
+	SELFTEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-capture-selftest.XXXXXX")
+	SELFTEST_ROOT=$(CDPATH='' cd -P -- "$SELFTEST_ROOT" && pwd -P)
+	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup' EXIT
+	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup; trap - INT; kill -s INT $$' INT
+	trap 'rm -rf "${SELFTEST_ROOT:-}"; cleanup; trap - TERM; kill -s TERM $$' TERM
+
+	check() {
+		if [ "$2" = "$3" ]; then
+			pass=$((pass + 1))
+			printf 'PASS  %s\n' "$1"
+		else
+			fail=$((fail + 1))
+			printf 'FAIL  %s\n        expected: %s\n        actual:   %s\n' "$1" "$2" "$3"
+		fi
+	}
+
+	check_contains() {
+		case "$3" in
+		*"$2"*)
+			pass=$((pass + 1))
+			printf 'PASS  %s\n' "$1"
+			;;
+		*)
+			fail=$((fail + 1))
+			printf 'FAIL  %s\n        wanted substring: %s\n        actual:   %s\n' "$1" "$2" "$3"
+			;;
+		esac
+	}
+
+	printf 'clipbasket-capture selftest\n'
+	printf '  bash:      %s\n' "${BASH_VERSION:-?}"
+	printf '  db:        %s\n' "$DB_CLI"
+	printf '  magick:    %s\n\n' "$(magick_cmd || printf 'not installed')"
+
+	# --- url_decode -------------------------------------------------------
+	check 'url_decode leaves a plain path alone' '/tmp/a.txt' "$(url_decode '/tmp/a.txt')"
+	check 'url_decode decodes %20' '/tmp/a b.txt' "$(url_decode '/tmp/a%20b.txt')"
+	check 'url_decode leaves a bare percent alone' '/tmp/100%.txt' "$(url_decode '/tmp/100%.txt')"
+	check 'url_decode leaves a truncated escape alone' '/tmp/a%2.txt' "$(url_decode '/tmp/a%2.txt')"
+	check 'url_decode turns %25 into one percent' '/tmp/a%b' "$(url_decode '/tmp/a%25b')"
+	check 'url_decode decodes a UTF-8 escape' '/tmp/café.txt' "$(url_decode '/tmp/caf%C3%A9.txt')"
+	check 'url_decode decodes a trailing escape' '/tmp/a b' "$(url_decode '/tmp/a%20b')"
+	check 'url_decode decodes %0A to a newline' "$(printf '/tmp/a\nb')" "$(url_decode '/tmp/a%0Ab')"
+	check 'url_decode accepts lowercase hex' '/tmp/a b' "$(url_decode '/tmp/a%20b')"
+	check 'url_decode leaves a lone trailing percent alone' '/tmp/a%' "$(url_decode '/tmp/a%')"
+
+	# --- uri lists --------------------------------------------------------
+	local list="$SELFTEST_ROOT/list" paths="$SELFTEST_ROOT/paths"
+	printf 'file:///tmp/a%%20b.txt\r\n#comment\nfile:///tmp/100%%25.txt\nhttps://example.com/x\n' >"$list"
+	uri_list_paths <"$list" >"$paths"
+	count_paths "$paths"
+	check 'uri_list_paths keeps only local files' '2' "$REPLY_COUNT"
+	check 'uri_list_paths decodes each path' '/tmp/a b.txt|/tmp/100%.txt|' \
+		"$(tr '\000' '|' <"$paths")"
+
+	printf 'file:///tmp/two%%0Alines.txt\n' >"$list"
+	uri_list_paths <"$list" >"$paths"
+	count_paths "$paths"
+	check 'a %0A in a file name stays one path, not two' '1' "$REPLY_COUNT"
+	check 'file_list_preview names that one file' "$(printf 'two\nlines.txt')" \
+		"$(file_list_preview "$paths" 1)"
+
+	printf 'file:///tmp/a.txt\nfile:///tmp/b.txt\nfile:///tmp/c.txt\n' >"$list"
+	uri_list_paths <"$list" >"$paths"
+	count_paths "$paths"
+	check 'three uris count as three paths' '3' "$REPLY_COUNT"
+	check 'file_list_preview summarises three files' 'a.txt, b.txt, +1' \
+		"$(file_list_preview "$paths" 3)"
+
+	# --- confidential markers ---------------------------------------------
+	confidential() {
+		if offer_is_confidential "$1"; then printf yes; else printf no; fi
+	}
+	check 'a KDE password hint is confidential' 'yes' \
+		"$(confidential "$(printf 'text/plain\napplication/x-kde-passwordManagerHint')")"
+	check 'the lowercase KDE spelling is confidential too' 'yes' \
+		"$(confidential "$(printf 'text/plain\napplication/x-kde-passwordmanagerhint')")"
+	check 'an nspasteboard ConcealedType is confidential' 'yes' \
+		"$(confidential "$(printf 'text/plain\norg.nspasteboard.ConcealedType')")"
+	check 'a lowercase nspasteboard marker is confidential too' 'yes' \
+		"$(confidential "$(printf 'text/plain\norg.nspasteboard.concealedtype')")"
+	check 'an ordinary offer is not confidential' 'no' \
+		"$(confidential "$(printf 'text/plain\ntext/html')")"
+
+	# --- end to end -------------------------------------------------------
+	local fix="$SELFTEST_ROOT/fixture" state="$SELFTEST_ROOT/state"
+	local wl_paste_stub="$SELFTEST_ROOT/wl-paste-stub"
+	local wl_copy_stub="$SELFTEST_ROOT/wl-copy-stub"
+	local failing_db="$SELFTEST_ROOT/db-fail" db_calls="$SELFTEST_ROOT/db-calls"
+	local payload_in="$SELFTEST_ROOT/in.txt"
+	mkdir -p "$fix" "$state"
+
+	cat >"$wl_paste_stub" <<-'STUB'
+		#!/bin/sh
+		fix="$CLIPBASKET_SELFTEST_FIXTURE"
+		if [ "$1" = "--list-types" ]; then
+			if [ -f "$fix/types" ]; then cat "$fix/types"; fi
+			exit 0
+		fi
+		if [ "$1" = "--no-newline" ] && [ "$2" = "--type" ]; then
+			name=$(printf '%s' "$3" | tr '/;=' '___')
+			if [ -f "$fix/type.$name" ]; then cat "$fix/type.$name"; exit 0; fi
+			exit 1
+		fi
+		exit 1
+	STUB
+	cat >"$wl_copy_stub" <<-STUB
+		#!/bin/sh
+		cat >"$SELFTEST_ROOT/wl-copy.stdin"
+	STUB
+	cat >"$failing_db" <<-STUB
+		#!/bin/sh
+		printf '%s\n' "\$1" >>"$db_calls"
+		if [ "\$1" = insert ]; then exit 1; fi
+		exit 0
+	STUB
+	chmod +x "$wl_paste_stub" "$wl_copy_stub" "$failing_db"
+	printf 'plain text payload\n' >"$payload_in"
+
+	export CLIPBASKET_SELFTEST_FIXTURE="$fix"
+	export CLIPBASKET_WL_PASTE="$wl_paste_stub"
+	export CLIPBASKET_WL_COPY="$wl_copy_stub"
+	export CLIPBASKET_STATE_DIR="$state"
+	export CLIPBASKET_DB="$state/clips.db"
+	export CLIPBASKET_DB_CLI="$DB_CLI"
+
+	reset_db() {
+		rm -rf "$state"
+		mkdir -p "$state"
+	}
+	run_capture() {
+		# $1 mode, $2 stdin file
+		"$SCRIPT_DIR/clipbasket-capture" "$1" <"$2" >>"$SELFTEST_ROOT/capture.log" 2>&1 || true
+	}
+	clip_count() {
+		"$DB_CLI" count 2>/dev/null | sed -n 's/.*"total":\([0-9]*\).*/\1/p'
+	}
+	asset_count() {
+		find "$state/images" -type f 2>/dev/null | wc -l | tr -d ' '
+	}
+	thumb_count() {
+		find "$state/thumbs" -type f 2>/dev/null | wc -l | tr -d ' '
+	}
+	# $1 dest, $2 width, $3 height. Signature + IHDR header only: enough for
+	# image_dimensions, which reads bytes 16..23, and small enough that no
+	# decoder will touch it.
+	write_png_header() {
+		printf '\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR' >"$1"
+		printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+			$(($2 / 16777216 % 256)) $(($2 / 65536 % 256)) $(($2 / 256 % 256)) $(($2 % 256)))" >>"$1"
+		printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' \
+			$(($3 / 16777216 % 256)) $(($3 / 65536 % 256)) $(($3 / 256 % 256)) $(($3 % 256)))" >>"$1"
+		printf 'tail-bytes-so-the-file-is-not-empty' >>"$1"
+	}
+
+	# H4: no offer at all. Both watchers see the same bytes on stdin, so the
+	# image watcher has to stand down or one copy is recorded twice -- once as
+	# text and once as a "PNG" that is not one.
+	reset_db
+	: >"$fix/types"
+	run_capture image "$payload_in"
+	check 'an empty offer records nothing on the image watcher' '0' "$(clip_count)"
+	run_capture text "$payload_in"
+	check 'an empty offer still records text on the text watcher' '1' "$(clip_count)"
+	check 'and records it as text, not as an image' 'text' \
+		"$("$DB_CLI" list --limit 1 2>/dev/null | sed -n 's/.*"kind":"\([a-z]*\)".*/\1/p')"
+
+	# H5: a file list whose insert fails is still a file list. Falling through
+	# to the text path recorded the same copy twice -- and the one-shot
+	# suppression token had already been spent.
+	reset_db
+	printf 'text/uri-list\ntext/plain\n' >"$fix/types"
+	printf 'file:///tmp/a%%20b.txt\n' >"$fix/type.text_uri-list"
+	: >"$db_calls"
+	export CLIPBASKET_DB_CLI="$failing_db"
+	run_capture text "$payload_in"
+	export CLIPBASKET_DB_CLI="$DB_CLI"
+	check 'a failed file-list insert does not fall through to the text path' '1' \
+		"$(grep -c '^insert$' "$db_calls" || true)"
+
+	# M10: a failed image insert must not leave an asset nothing references.
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	write_png_header "$SELFTEST_ROOT/small.png" 800 600
+	: >"$db_calls"
+	export CLIPBASKET_DB_CLI="$failing_db"
+	run_capture image "$SELFTEST_ROOT/small.png"
+	export CLIPBASKET_DB_CLI="$DB_CLI"
+	check 'a failed image insert leaves no orphan in images/' '0' "$(asset_count)"
+
+	reset_db
+	run_capture image "$SELFTEST_ROOT/small.png"
+	check 'a successful image insert records one clip' '1' "$(clip_count)"
+	check 'and commits exactly one asset' '1' "$(asset_count)"
+	check 'with the dimensions read from the PNG header' 'Image 800x600' \
+		"$("$DB_CLI" list --limit 1 2>/dev/null | sed -n 's/.*"preview":"\([^"]*\)".*/\1/p')"
+
+	# The decoded-pixel guard, before any thumbnailing happens.
+	reset_db
+	write_png_header "$SELFTEST_ROOT/huge.png" 20000 20000
+	run_capture image "$SELFTEST_ROOT/huge.png"
+	check 'an image over the pixel cap is not recorded' '0' "$(clip_count)"
+	check 'and leaves no asset behind' '0' "$(asset_count)"
+
+	# ImageMagick is an unsandboxed decoder. Assert the exact resource envelope
+	# on both the header probe and thumbnail conversion, then make the probe fail
+	# and prove that unknown dimensions do not fall through to a full decode.
+	local magick_bin="$SELFTEST_ROOT/magick-bin" magick_log="$SELFTEST_ROOT/magick.log"
+	local old_path="$PATH" unknown_image="$SELFTEST_ROOT/unknown-image"
+	mkdir -p "$magick_bin"
+	cat >"$magick_bin/magick" <<-'STUB'
+		#!/bin/sh
+		printf '%s\n' "$*" >>"$CLIPBASKET_SELFTEST_MAGICK_LOG"
+		if [ "$1" = identify ]; then
+			[ -z "${CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY:-}" ] || exit 1
+			printf '32 16'
+			exit 0
+		fi
+		last=''
+		for last do :; done
+		printf 'THUMB' >"${last#png:}"
+	STUB
+	chmod +x "$magick_bin/magick"
+	export CLIPBASKET_SELFTEST_MAGICK_LOG="$magick_log"
+	PATH="$magick_bin:$PATH"
+	export PATH
+
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	: >"$magick_log"
+	run_capture image "$SELFTEST_ROOT/small.png"
+	check 'ImageMagick limits wrap both identify and thumbnail' '2' \
+		"$(grep -c -- '-limit memory 256MiB -limit map 256MiB -limit area 64MP -limit time 10' "$magick_log" || true)"
+	check 'the limited conversion still publishes a thumbnail' '1' "$(thumb_count)"
+
+	reset_db
+	printf 'not an image header' >"$unknown_image"
+	: >"$magick_log"
+	export CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY=1
+	run_capture image "$unknown_image"
+	unset CLIPBASKET_SELFTEST_MAGICK_FAIL_IDENTIFY
+	check 'an image with unknown dimensions is still recorded' '1' "$(clip_count)"
+	check 'unknown dimensions skip the thumbnail decoder' '0' \
+		"$(grep -c -- '-thumbnail' "$magick_log" || true)"
+	check 'and no thumbnail asset is published' '0' "$(thumb_count)"
+
+	PATH="$old_path"
+	export PATH
+	unset CLIPBASKET_SELFTEST_MAGICK_LOG
+
+	# The confidential parity switch.
+	reset_db
+	printf 'text/plain\napplication/x-kde-passwordManagerHint\n' >"$fix/types"
+	run_capture text "$payload_in"
+	check 'a confidential offer is skipped by default' '0' "$(clip_count)"
+	export CLIPBASKET_IGNORE_CONFIDENTIAL=0
+	run_capture text "$payload_in"
+	unset CLIPBASKET_IGNORE_CONFIDENTIAL
+	check 'CLIPBASKET_IGNORE_CONFIDENTIAL=0 records it anyway' '1' "$(clip_count)"
+
+	# The file-URI round trip: db copy encodes, capture decodes, and the paths
+	# have to come back byte for byte.
+	reset_db
+	local files_dir="$SELFTEST_ROOT/files"
+	mkdir -p "$files_dir"
+	: >"$files_dir/a b.txt"
+	: >"$files_dir/100%.txt"
+	printf '{"kind":"files","preview":"a b.txt","hash":"h-round","files":[{"path":"%s/a b.txt","name":"a b.txt"},{"path":"%s/100%%.txt","name":"100%%.txt"}]}\n' \
+		"$files_dir" "$files_dir" | "$DB_CLI" insert >/dev/null
+	"$DB_CLI" copy "$("$DB_CLI" list --limit 1 | sed -n 's/.*"id":\([0-9]*\).*/\1/p')" >/dev/null
+	check_contains 'copy percent-encodes a space' '%20b.txt' "$(cat "$SELFTEST_ROOT/wl-copy.stdin")"
+	check_contains 'copy percent-encodes a percent' '100%25.txt' "$(cat "$SELFTEST_ROOT/wl-copy.stdin")"
+	cp -- "$SELFTEST_ROOT/wl-copy.stdin" "$fix/type.text_uri-list"
+	printf 'text/uri-list\ntext/plain\n' >"$fix/types"
+	run_capture text "$payload_in"
+	local listing
+	listing=$("$DB_CLI" list --limit 10 --filter files 2>/dev/null)
+	check_contains 'a re-copied path with a space round-trips exactly' \
+		"\"path\":\"$files_dir/a b.txt\"" "$listing"
+	check_contains 'a re-copied path with a percent round-trips exactly' \
+		"\"path\":\"$files_dir/100%.txt\"" "$listing"
+
+	# The uri-list bound must retain one extra byte long enough to distinguish an
+	# exact-limit list from a truncated final path. Oversized lists are owned and
+	# dropped by both watchers rather than reinterpreted as text or image.
+	local uri_size
+	printf 'file:///tmp/exact-limit.txt\n' >"$fix/type.text_uri-list"
+	uri_size=$(file_size "$fix/type.text_uri-list")
+	reset_db
+	out=$(printf 'plain fallback' |
+		CLIPBASKET_MAX_URI_LIST_BYTES="$uri_size" "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check 'a uri-list exactly at the byte limit is accepted' '1' "$(clip_count)"
+	check 'and it is classified as files' '1' \
+		"$($DB_CLI count --filter files 2>/dev/null | sed -n 's/.*\"filtered\":\([0-9]*\).*/\1/p')"
+
+	reset_db
+	out=$(printf 'plain fallback' |
+		CLIPBASKET_MAX_URI_LIST_BYTES=$((uri_size - 1)) "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an oversized uri-list is rejected instead of truncated' 'file list' "$out"
+	check_contains 'and the uri-list log names the configured limit' "limit $((uri_size - 1))" "$out"
+	check 'the text watcher does not record its fallback rendering' '0' "$(clip_count)"
+	out=$(CLIPBASKET_MAX_URI_LIST_BYTES=$((uri_size - 1)) \
+		"$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	check 'the image watcher also claims and drops the oversized file offer' '0' "$(clip_count)"
+
+	# predictable-path hardening: a planted symlink at images/ is refused
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	rm -rf "$state/images"; mkdir -p "$state/elsewhere"; ln -s "$state/elsewhere" "$state/images"
+	sym_out=$("$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	case "$sym_out" in
+	*symlink*) pass=$((pass+1)); printf 'PASS  %s\n' 'a planted symlink at images/ is refused' ;;
+	*) fail=$((fail+1)); printf 'FAIL  a planted symlink at images/ is refused\n        got: %s\n' "$sym_out" ;;
+	esac
+	check 'and nothing was written through it' "0" "$(find "$state/elsewhere" -type f 2>/dev/null | wc -l | tr -d ' ')"
+	rm -f "$state/images"
+
+	# A symlink planted at the content-addressed image name itself, rather than
+	# at the directory. Nothing checks that path before writing -- the refusal
+	# has to come from the descriptor-bound publish, which is the point.
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	mkdir -p "$state/images"
+	printf 'original\n' >"$state/victim.png"
+	sym_hash=$(sha256_of image "$SELFTEST_ROOT/small.png")
+	ln -sf "$state/victim.png" "$state/images/$sym_hash.png"
+	sym_out=$("$SCRIPT_DIR/clipbasket-capture" image <"$SELFTEST_ROOT/small.png" 2>&1 || true)
+	case "$sym_out" in
+	*symlink*) pass=$((pass+1)); printf 'PASS  %s\n' 'a planted symlink at the image name is refused' ;;
+	*) fail=$((fail+1)); printf 'FAIL  a planted symlink at the image name is refused\n        got: %s\n' "$sym_out" ;;
+	esac
+	check 'and the file behind the link is untouched' 'original' "$(cat "$state/victim.png")"
+	rm -f "$state/images/$sym_hash.png" "$state/victim.png"
+
+	# hyprctl reports a client-controlled initialClass. Feed an endless single
+	# line and prove the parser sees only the first 256 producer bytes.
+	local hypr_bin="$SELFTEST_ROOT/hypr-bin" app app_bytes
+	mkdir -p "$hypr_bin"
+	cat >"$hypr_bin/hyprctl" <<-'STUB'
+		#!/bin/sh
+		[ "$1" = activewindow ] || exit 1
+		printf 'initialClass: '
+		yes x | tr -d '\n'
+	STUB
+	chmod +x "$hypr_bin/hyprctl"
+	old_path="$PATH"
+	PATH="$hypr_bin:$PATH"
+	export PATH
+	app=$(source_app)
+	PATH="$old_path"
+	export PATH
+	app_bytes=$(printf '%s' "$app" | wc -c | tr -d ' ')
+	check 'source_app bounds client-controlled hyprctl output' 'bounded' \
+		"$([ "$app_bytes" -le 256 ] && printf bounded || printf "unbounded:$app_bytes")"
+
+	# --list-types is queried before the confidential check. A partial list
+	# cannot prove an offer is safe, so oversized and never-ending producers are
+	# bounded at limit+1 and the entire change is dropped.
+	reset_db
+	printf 'text/plain\napplication/x-kde-passwordManagerHint\n' >"$fix/types"
+	out=$(printf 'must not be recorded' |
+		CLIPBASKET_MAX_TYPES_BYTES=16 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an oversized MIME list is rejected before classification' 'MIME list' "$out"
+	check_contains 'and the MIME-list log names its configured limit' 'limit 16' "$out"
+	check 'a confidential marker beyond the cap cannot be recorded' '0' "$(clip_count)"
+
+	if command -v timeout >/dev/null 2>&1; then
+		local endless_types="$SELFTEST_ROOT/endless-types" types_rc=0
+		cat >"$endless_types" <<-'STUB'
+			#!/bin/sh
+			if [ "$1" = --list-types ]; then exec yes text/plain; fi
+			exit 1
+		STUB
+		chmod +x "$endless_types"
+		out=$(timeout 10 env CLIPBASKET_WL_PASTE="$endless_types" \
+			CLIPBASKET_MAX_TYPES_BYTES=64 "$SCRIPT_DIR/clipbasket-capture" text \
+			<"$payload_in" 2>&1) || types_rc=$?
+		out="${out} rc=$types_rc"
+		check_contains 'a never-ending MIME producer does not hang the watcher' 'rc=0' "$out"
+		check_contains 'and its partial type list is rejected' 'MIME list' "$out"
+	else
+		pass=$((pass + 2))
+		printf 'PASS  %s\n' 'a never-ending MIME producer does not hang the watcher (skipped: no timeout)'
+		printf 'PASS  %s\n' 'and its partial type list is rejected (skipped: no timeout)'
+	fi
+
+	# --- bounded producer reads (marketplace review, third round) -----------
+	# Each limit used to be checked after the whole producer stream had been
+	# buffered. These assert that the read itself is bounded: the producer is
+	# cut off, the clip is still rejected by the existing check, and a producer
+	# that never closes the pipe does not hang the watcher.
+	reset_db
+	printf 'text/plain\n' >"$fix/types"
+
+	# A producer that keeps writing 4 KiB chunks and records how many it has
+	# managed to write. If the read were unbounded it would write all 512;
+	# `head -c` closing the pipe kills it with SIGPIPE almost immediately.
+	local greedy="$SELFTEST_ROOT/greedy" chunks="$SELFTEST_ROOT/chunks"
+	cat >"$greedy" <<-STUB
+		#!/bin/sh
+		i=0
+		while [ \$i -lt 512 ]; do
+			dd if=/dev/zero bs=4096 count=1 2>/dev/null | tr '\\0' 'a' || exit 0
+			i=\$((i + 1))
+			printf '%s' "\$i" >"$chunks"
+		done
+	STUB
+	chmod +x "$greedy"
+
+	printf '0' >"$chunks"
+	out=$(CLIPBASKET_MAX_TEXT_BYTES=4096 "$greedy" |
+		CLIPBASKET_MAX_TEXT_BYTES=4096 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an over-limit text stream is rejected' 'skipping' "$out"
+	check_contains 'and the limit it names is the configured one' 'limit 4096' "$out"
+	# The read wants 4097 bytes; anything past that is the kernel pipe buffer
+	# and scheduling slack before SIGPIPE lands, which is tens of KiB at most.
+	# 64 chunks is 256 KiB -- an eighth of the stream, and unmistakably not the
+	# 512 an unbounded read would have drained.
+	check 'and the producer was cut off rather than drained' 'bounded' \
+		"$( [ "$(cat "$chunks")" -le 64 ] && echo bounded || echo "drained:$(cat "$chunks")" )"
+	check 'and nothing was recorded' '0' "$(clip_count)"
+
+	# The same for the image watcher, which has its own limit and its own
+	# ingest branch.
+	reset_db
+	printf 'image/png\n' >"$fix/types"
+	printf '0' >"$chunks"
+	out=$("$greedy" |
+		CLIPBASKET_MAX_IMAGE_BYTES=4096 "$SCRIPT_DIR/clipbasket-capture" image 2>&1 || true)
+	check_contains 'an over-limit image stream is rejected' 'skipping' "$out"
+	check 'and that producer was cut off too' 'bounded' \
+		"$( [ "$(cat "$chunks")" -le 64 ] && echo bounded || echo "drained:$(cat "$chunks")" )"
+
+	# The html flavour reads a second producer of its own, so it is bounded
+	# separately from the payload on stdin.
+	reset_db
+	printf 'text/plain\ntext/html\n' >"$fix/types"
+	dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\0' 'h' >"$fix/type.text_html"
+	out=$(printf 'plain text here' |
+		CLIPBASKET_MAX_HTML_BYTES=1024 "$SCRIPT_DIR/clipbasket-capture" text 2>&1 || true)
+	check_contains 'an over-limit html flavour is dropped' 'dropping' "$out"
+	check_contains 'and it says the plain text is kept' 'keeping the plain text' "$out"
+	check 'and the text clip is still recorded without it' '1' "$(clip_count)"
+	rm -f "$fix/type.text_html"
+
+	# A producer that never closes the pipe. Without a bounded read this hangs
+	# forever, which is the failure this whole section exists to prevent --
+	# so it is run under `timeout` and skipped where that is unavailable
+	# rather than risking a suite that never returns.
+	if command -v timeout >/dev/null 2>&1; then
+		reset_db
+		printf 'text/plain\n' >"$fix/types"
+		local endless="$SELFTEST_ROOT/endless" endless_rc=0
+		cat >"$endless" <<-'STUB'
+			#!/bin/sh
+			exec yes a
+		STUB
+		chmod +x "$endless"
+		# Put timeout around the whole pipeline. Wrapping only the consumer leaves
+		# a shell-based producer free to sleep after its writer receives SIGPIPE.
+		out=$(timeout 10 env CLIPBASKET_MAX_TEXT_BYTES=1024 \
+			sh -c '"$1" | "$2" text' sh "$endless" "$SCRIPT_DIR/clipbasket-capture" \
+			2>&1) || endless_rc=$?
+		out="${out} rc=$endless_rc"
+		check_contains 'a never-closing producer does not hang the watcher' 'rc=0' "$out"
+		check_contains 'and its stream is rejected by the size limit' 'skipping' "$out"
+	else
+		pass=$((pass + 2))
+		printf 'PASS  %s\n' 'a never-closing producer does not hang the watcher (skipped: no timeout)'
+		printf 'PASS  %s\n' 'and its stream is rejected by the size limit (skipped: no timeout)'
+	fi
+
+	unset CLIPBASKET_SELFTEST_FIXTURE CLIPBASKET_WL_PASTE CLIPBASKET_WL_COPY
+	unset CLIPBASKET_STATE_DIR CLIPBASKET_DB CLIPBASKET_DB_CLI
+
+
+	printf '\n%s passed, %s failed\n' "$pass" "$fail"
+	[ "$fail" -eq 0 ] || return 1
+	return 0
+}
+main() {
+	local mode="${1:-text}" types='' types_file types_size stdin_file
+
+	case "$mode" in
+	--selftest | selftest)
+		cmd_selftest
+		return $?
+		;;
+	esac
+
+	[ -x "$DB_CLI" ] || {
+		log "clipbasket-db not found at $DB_CLI"
+		exit 1
+	}
+	clipboard_state_is_recordable || exit 0
+
+	# MIME discovery is a producer read just like the payload. It happens before
+	# the confidential marker check, so an unbounded owner here could otherwise
+	# wedge the watcher before the password-manager policy even runs.
+	mktempfile
+	types_file="$REPLY_TMPFILE"
+	"$WL_PASTE_BIN" --list-types 2>/dev/null |
+		bounded_cat $((MAX_TYPES_BYTES + 1)) >"$types_file" || true
+	types_size=$(file_size "$types_file")
+	if [ "$types_size" -gt "$MAX_TYPES_BYTES" ]; then
+		# A partial type list cannot prove that the offer is non-confidential or
+		# classify which watcher owns it. Fail closed and wait for the next change.
+		log "skipping clipboard offer with ${types_size}-byte MIME list (limit $MAX_TYPES_BYTES)"
+		exit 0
+	fi
+	IFS= read -r -d '' types <"$types_file" || true
+	if [ "$IGNORE_CONFIDENTIAL" != "0" ] && offer_is_confidential "$types"; then
+		log 'skipping confidential clipboard offer'
+		exit 0
+	fi
+
+	# No offer, no classification. Both watchers are handed the same bytes on
+	# stdin, and it is only the MIME list that says which of them owns the
+	# change -- so without it the image watcher must stand down, or one copy
+	# lands twice: once as text and once as a "PNG" that is not one.
+	if [ -z "$types" ] && [ "$mode" = "image" ]; then
+		log 'no MIME types on the offer; leaving this change to the text watcher'
+		exit 0
+	fi
+
+	# One offer, one clip. Priority mirrors the Tauri capture path: a file copy
+	# beats the image beats the text rendering of the same thing.
+	local has_files=0 has_image=0
+	case "$types" in *text/uri-list*) has_files=1 ;; esac
+	case "$types" in image/* | *$'\n'image/*) has_image=1 ;; esac
+
+	mktempfile
+	stdin_file="$REPLY_TMPFILE"
+	# Bounded at ingest, by the limit that applies to whichever watcher this is.
+	# The per-kind checks further down are unchanged; they now examine a file
+	# that cannot have grown past limit+1 bytes.
+	if [ "$mode" = "image" ]; then
+		bounded_cat $((MAX_IMAGE_BYTES + 1)) >"$stdin_file"
+	else
+		bounded_cat $((MAX_TEXT_BYTES + 1)) >"$stdin_file"
+	fi
+
+	if [ "$has_files" = 1 ]; then
+		# text/uri-list is also how some apps advertise a plain list of links,
+		# so this only wins if the payload really resolves to local paths.
+		if [ "$mode" = "text" ]; then
+			local files_status=0
+			capture_files || files_status=$?
+			# 1 alone means "not a local file list"; 0 and 2 both mean this
+			# change was ours, recorded or not, and must not be recorded again
+			# as its plain-text rendering.
+			[ "$files_status" = 1 ] || exit 0
+		elif [ "$mode" = "image" ] && offer_is_local_file_list; then
+			exit 0
+		fi
+	fi
+
+	case "$mode" in
+	image)
+		capture_image "$stdin_file" "$types" || true
+		;;
+	text)
+		if [ "$has_image" = 1 ]; then
+			# The image watcher owns this change; recording the text as well
+			# would give one copy two rows.
+			exit 0
+		fi
+		capture_text "$stdin_file" "$types" || true
+		;;
+	*)
+		log "unknown mode: $mode"
+		exit 2
+		;;
+	esac
+}
+
+main "$@"

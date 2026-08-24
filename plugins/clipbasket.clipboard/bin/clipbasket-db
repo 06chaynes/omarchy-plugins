@@ -1,0 +1,2031 @@
+#!/usr/bin/env bash
+# clipbasket-db — the only thing that touches Clipbasket's data.
+#
+# Every subcommand prints exactly one JSON document on stdout and never
+# prompts. Diagnostics go to stderr. See docs/DATA.md for the contract.
+#
+# Implementation notes that matter if you edit this file:
+#
+#   * SQL is fed to sqlite3 on STDIN, never as an argv string. That is the only
+#     form in which the CLI honours dot-commands, which is how the noisy PRAGMA
+#     output gets routed to /dev/null without polluting the JSON on stdout.
+#   * JSON is built by SQLite's json_object(), one object per output line, and
+#     stitched into an array by awk. json_object() escapes newlines, quotes and
+#     control characters, so "one row == one line" holds for any payload.
+#   * Caller-supplied strings reach SQL either through sql_quote() (short
+#     values: search terms, paths) or through readfile() on a mktemp file
+#     (arbitrary/huge values: the insert payload). Nothing is interpolated raw,
+#     and ids are rejected unless they are pure digits.
+#   * This is on the UI's keystroke path, so the hot subcommands avoid forking:
+#     strings are built with bash parameter expansion and `printf -v` rather
+#     than command substitution, because at ~3ms per fork the process count is
+#     the whole latency budget — sqlite3's own work is around 1ms at 10k clips.
+
+set -euo pipefail
+
+# 1 -> 2 added clips.html, the text/html clipboard flavour a web copy carries.
+SCHEMA_VERSION=2
+APP_NAME=Clipbasket
+
+STATE_DIR="${CLIPBASKET_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/clipbasket}"
+DB_PATH="${CLIPBASKET_DB:-$STATE_DIR/clips.db}"
+IMAGE_DIR="$STATE_DIR/images"
+THUMB_DIR="$STATE_DIR/thumbs"
+SUPPRESS_FILE="$STATE_DIR/suppress"
+SQLITE_BIN="${CLIPBASKET_SQLITE:-sqlite3}"
+WL_COPY_BIN="${CLIPBASKET_WL_COPY:-wl-copy}"
+
+SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+# Absolute, because pin_state_dir moves this process's working directory and a
+# relative $0 stops resolving the moment it does.
+SELF_BIN="$SCRIPT_DIR/$(basename -- "$0")"
+HTML2MD="${CLIPBASKET_HTML2MD:-$SCRIPT_DIR/clipbasket-html2md}"
+SAFEFILE="${CLIPBASKET_SAFEFILE:-$SCRIPT_DIR/clipbasket-safefile}"
+
+# The state, image and thumbnail directories sit at predictable paths, so
+# another process running as the same user could plant a symlink there ahead of
+# us and redirect every database and captured-content write wherever it likes.
+# Never create-and-trust: refuse anything that already exists as a symlink or
+# as something we do not own, and only then create it. (Marketplace security
+# review finding, 2026-08-24.)
+ensure_private_dir() {
+	# $1 path, $2 mode for a fresh create (optional, default 700)
+	local dir="$1" mode="${2:-700}" owner
+	if [ -L "$dir" ]; then
+		die "$dir is a symlink; refusing to write through it"
+	fi
+	if [ -e "$dir" ]; then
+		[ -d "$dir" ] || die "$dir exists and is not a directory"
+		owner=$(stat -c %u -- "$dir" 2>/dev/null || stat -f %u -- "$dir" 2>/dev/null)
+		[ "$owner" = "$(id -u)" ] || die "$dir is not owned by the current user"
+		return 0
+	fi
+	mkdir -p -- "$dir" || die "could not create $dir"
+	[ -L "$dir" ] && die "$dir became a symlink; refusing"
+	chmod "$mode" -- "$dir" 2>/dev/null || true
+}
+
+# A regular file at a predictable path gets the same treatment before we write.
+refuse_symlink() {
+	[ -L "$1" ] && die "$1 is a symlink; refusing to write through it"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Descriptor-bound writes.
+#
+# The two checks above are fast-fail UX: they turn the common mistake into a
+# clear message without paying for a subprocess. They are NOT the security
+# boundary, because a pathname check followed by a shell redirection is a
+# check-to-use window -- between the check and the `>`, a same-user process can
+# replace the directory with a symlink and the write lands somewhere else.
+#
+# Every real write goes through clipbasket-safefile, which opens each path
+# component with O_NOFOLLOW, verifies the descriptor with fstat, and writes and
+# renames relative to that descriptor. bash cannot express any of that.
+# (Marketplace security review, second round, 2026-08-24.)
+safe_write() {
+	# $1 dir, $2 name, $3 mode, $4 maximum input bytes. Content on stdin.
+	local dir="$1" name="$2" mode="${3:-600}" max="${4:-1048576}" rc=0
+	"$SAFEFILE" write "$dir" "$name" --mode "$mode" --max-bytes "$max" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to write $dir/$name (clipbasket-safefile exit $rc)"
+}
+
+safe_read() {
+	# $1 dir, $2 name. Content on stdout. Exit 2 (missing) is not an error.
+	local rc=0
+	"$SAFEFILE" read "$1" "$2" || rc=$?
+	case "$rc" in
+	0) return 0 ;;
+	2) return 1 ;;
+	*) die "refusing to read $1/$2 (clipbasket-safefile exit $rc)" ;;
+	esac
+}
+
+safe_unlink() {
+	local rc=0
+	"$SAFEFILE" unlink "$1" "$2" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to remove $1/$2 (clipbasket-safefile exit $rc)"
+}
+
+safe_ensure_dir() {
+	# $1 path, $2 mode. Creates missing components with O_NOFOLLOW at each step.
+	local rc=0
+	"$SAFEFILE" ensure-dir "$1" --mode "${2:-700}" || rc=$?
+	[ "$rc" -eq 0 ] || die "refusing to use $1 (clipbasket-safefile exit $rc)"
+}
+
+# Holds the state directory as the working directory of this process, so every
+# later sqlite3 open is resolved against a descriptor we verified rather than a
+# pathname anyone can re-point. `cd -P` refuses to resolve through symlinks
+# silently: if any component were one, $PWD would not come back equal to the
+# path we asked for. After this, the database is opened as ./clips.db, and its
+# -wal and -shm files follow it into the same held directory.
+#
+# Costs no subprocess: `cd`, `[ -O . ]` and $PWD are all shell builtins, and
+# this is on the UI keystroke path where a fork is the whole latency budget.
+#
+# CLIPBASKET_DB is a test-only override; a database pointed somewhere else on
+# purpose is not pinned, because there is no directory we own to pin it to.
+STATE_DIR_PINNED=0
+
+# Marker paths are relative after the state directory is pinned. The hot path
+# never opens them: their non-symlink, owned, regular-file existence is only an
+# untrusted cache hint, equivalent to another same-user process creating or
+# removing a file inside our state directory. All actual writes and removals go
+# through clipbasket-safefile, so a planted marker symlink is never followed.
+STAMP_PREFIX="$STATE_DIR/"
+FTS_ENABLED_STAMP='.fts-enabled'
+FTS_DISABLED_STAMP='.fts-disabled'
+
+# Recomputed rather than trusted: STATE_DIR is reassigned after this file is
+# sourced -- the selftest points it at a scratch directory -- so a prefix
+# captured at load time would send the stamps somewhere else entirely. It is
+# refreshed at the top of ensure_schema before marker checks and writes, and
+# stays fork-free.
+set_stamp_prefix() {
+	if [ "$STATE_DIR_PINNED" = "1" ]; then
+		STAMP_PREFIX="./"
+	else
+		STAMP_PREFIX="$STATE_DIR/"
+	fi
+}
+
+stamp_marker_present() {
+	local path="${STAMP_PREFIX}$1"
+	[ ! -L "$path" ] && [ -f "$path" ] && [ -O "$path" ]
+}
+
+write_stamp_marker() {
+	# Marker content is deliberately irrelevant; the fast path never reads it.
+	printf 'ready\n' | safe_write "$STATE_DIR" "$1" 600 16
+}
+
+pin_state_dir() {
+	[ "$STATE_DIR_PINNED" = "1" ] && return 0
+	[ -z "${CLIPBASKET_DB:-}" ] || return 0
+	# The selftest drives cmd_* in-process against its own scratch DB_PATH;
+	# pinning would both overwrite that and move the CWD out from under the
+	# relative paths the suite uses.
+	[ -z "${SELFTEST_ROOT:-}" ] || return 0
+	# A relative state directory has no stable meaning once we chdir.
+	case "$STATE_DIR" in /*) ;; *) return 0 ;; esac
+	cd -P -- "$STATE_DIR" 2>/dev/null || return 1
+	[ "$PWD" = "$STATE_DIR" ] ||
+		die "$STATE_DIR resolves to $PWD; refusing to write through a symlink"
+	[ -O . ] || die "$STATE_DIR is not owned by the current user"
+	DB_PATH="./clips.db"
+	STATE_DIR_PINNED=1
+	return 0
+}
+
+# Mirrors RECENT_DUPLICATE_CAPTURE_WINDOW_MS in the Tauri app: re-copying the
+# same payload inside this window is a no-op rather than a re-order, so a clip
+# the user is actively pasting around does not thrash to the top repeatedly.
+RECENT_DUPLICATE_WINDOW="${CLIPBASKET_DEDUPE_WINDOW:-300}"
+PREVIEW_CHARS=180
+# `list` returns a truncated `text` so a large page stays small; `get` returns
+# the full payload. `text_truncated` tells the caller which one it is holding.
+LIST_TEXT_CHARS="${CLIPBASKET_LIST_TEXT_CHARS:-2000}"
+
+FTS_ENABLED=0
+TMPFILES=()
+
+# Scratch globals. The hot subcommands write their results here instead of
+# through $( ), which would cost a fork each time.
+REPLY_SQL=''
+REPLY_QUOTED=''
+CLIP_JSON_LIST=''
+CLIP_JSON_FULL=''
+
+cleanup() {
+	if [ "${#TMPFILES[@]}" -gt 0 ]; then
+		rm -f "${TMPFILES[@]}"
+	fi
+}
+
+# EXIT on its own is not enough: a signal with no handler kills bash outright
+# and the EXIT trap never runs, so an interrupted `copy` or `insert` leaves the
+# clipboard payload sitting in $TMPDIR. Each handler cleans up, disarms itself
+# and re-raises, so the exit status still reports the signal.
+on_signal() {
+	cleanup
+	trap - "$1" EXIT
+	kill -s "$1" "$$"
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
+# Creates a temp file, records it for cleanup, and leaves the path in
+# REPLY_TMPFILE. Deliberately not a `$(mktempfile)` helper: a command
+# substitution runs in a subshell, so the array it appended to went out of
+# scope with the subshell and cleanup had nothing left to remove -- every run
+# leaked its clipboard payload into $TMPDIR. It also saves a fork per call.
+REPLY_TMPFILE=''
+mktempfile() {
+	REPLY_TMPFILE=$(mktemp "${TMPDIR:-/tmp}/clipbasket.XXXXXX") ||
+		die "could not create a temp file in ${TMPDIR:-/tmp}"
+	TMPFILES[${#TMPFILES[@]}]="$REPLY_TMPFILE"
+}
+
+json_string() {
+	printf '"%s"' "$(printf '%s' "$*" | tr -d '\000-\037' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+}
+
+die() {
+	printf '{"ok":false,"error":%s}\n' "$(json_string "$*")"
+	exit 1
+}
+
+# Single-quote a value for use as a SQL literal, into REPLY_QUOTED.
+# Pure parameter expansion, so it is fork-free and safe for any UTF-8 text.
+sql_quote() {
+	local escaped=${1//\'/\'\'}
+	REPLY_QUOTED="'$escaped'"
+}
+
+require_id() {
+	case "${1:-}" in
+	'' | *[!0-9]*) die "expected a numeric clip id, got: ${1:-<missing>}" ;;
+	esac
+}
+
+# Same as require_id, plus a length cap: --limit and --max reach bash
+# arithmetic, and `[ 99999999999999999999 -gt 0 ]` is a shell error message on
+# stderr rather than the JSON error the caller is parsing.
+require_count() {
+	case "${1:-}" in
+	'' | *[!0-9]*) die "expected a non-negative number, got: ${1:-<missing>}" ;;
+	esac
+	[ "${#1}" -le 9 ] || die "number out of range: $1"
+}
+
+# One pass over the byte alphabet, reused by everything that has to move raw
+# bytes through the shell: BYTE_CHAR turns hex back into bytes, URI_ENCODE
+# turns a byte into its RFC 3986 form (unreserved set plus '/', which stays a
+# path separator). Built lazily -- `list` never needs it.
+BYTE_CHAR=()
+URI_ENCODE=()
+build_byte_tables() {
+	[ "${#BYTE_CHAR[@]}" -eq 256 ] && return 0
+	local i oct char
+	for ((i = 0; i < 256; i++)); do
+		printf -v oct '%03o' "$i"
+		printf -v char '%b' "\\0$oct"
+		BYTE_CHAR[i]="$char"
+		if ((i == 45 || i == 46 || i == 47 || i == 95 || i == 126 ||
+			(i >= 48 && i <= 57) || (i >= 65 && i <= 90) || (i >= 97 && i <= 122))); then
+			URI_ENCODE[i]="$char"
+		else
+			printf -v char '%%%02X' "$i"
+			URI_ENCODE[i]="$char"
+		fi
+	done
+}
+
+# $1 uppercase hex of a UTF-8 string -> the string itself, in REPLY_SQL.
+hex_decode() {
+	local hex="$1" out=''
+	build_byte_tables
+	while [ -n "$hex" ]; do
+		out+="${BYTE_CHAR[$((16#${hex:0:2}))]}"
+		hex=${hex:2}
+	done
+	REPLY_SQL="$out"
+}
+
+# $1 uppercase hex of a UTF-8 path -> its percent-encoded form, in REPLY_SQL.
+hex_to_uri_path() {
+	local hex="$1" out=''
+	build_byte_tables
+	while [ -n "$hex" ]; do
+		out+="${URI_ENCODE[$((16#${hex:0:2}))]}"
+		hex=${hex:2}
+	done
+	REPLY_SQL="$out"
+}
+
+# ---------------------------------------------------------------------------
+# sqlite plumbing
+# ---------------------------------------------------------------------------
+
+# The sqlite3 CLI ships with trusted_schema off, which makes any trigger that
+# touches an FTS5 virtual table fail at runtime with "unsafe use of virtual
+# table". We own this database file outright, so turning it back on is the
+# documented fix rather than a loosening of someone else's schema.
+SQL_PRELUDE='.output /dev/null
+PRAGMA busy_timeout=5000;
+PRAGMA trusted_schema=ON;
+PRAGMA foreign_keys=ON;
+PRAGMA synchronous=NORMAL;
+.output stdout'
+
+# Runs SQL read from stdin with no schema guarantees. Used by the bootstrap.
+run_raw() {
+	"$SQLITE_BIN" -batch -noheader -list "$DB_PATH"
+}
+
+# Runs the SQL in $1 against an initialised database.
+run_sql() {
+	"$SQLITE_BIN" -batch -noheader -list "$DB_PATH" <<<"$SQL_PRELUDE
+$1"
+}
+
+base_schema() {
+	cat <<-SQL
+		.output /dev/null
+		PRAGMA busy_timeout=5000;
+		PRAGMA trusted_schema=ON;
+		PRAGMA journal_mode=WAL;
+		PRAGMA synchronous=NORMAL;
+		.output stdout
+		CREATE TABLE IF NOT EXISTS clips (
+		  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		  kind         TEXT    NOT NULL,
+		  preview      TEXT    NOT NULL DEFAULT '',
+		  text         TEXT,
+		  html         TEXT,
+		  hash         TEXT    NOT NULL UNIQUE,
+		  source_app   TEXT,
+		  created_at   INTEGER NOT NULL,
+		  pinned       INTEGER NOT NULL DEFAULT 0,
+		  saved        INTEGER NOT NULL DEFAULT 0,
+		  image_path   TEXT,
+		  thumb_path   TEXT,
+		  image_width  INTEGER,
+		  image_height INTEGER,
+		  url_domain   TEXT,
+		  url_title    TEXT,
+		  file_count   INTEGER NOT NULL DEFAULT 0,
+		  files_json   TEXT,
+		  mime         TEXT,
+		  size_bytes   INTEGER,
+		  searchable   TEXT    NOT NULL DEFAULT ''
+		);
+		CREATE INDEX IF NOT EXISTS idx_clips_order
+		  ON clips(pinned DESC, created_at DESC, id DESC);
+		CREATE INDEX IF NOT EXISTS idx_clips_kind_order
+		  ON clips(kind, created_at DESC, id DESC);
+		CREATE INDEX IF NOT EXISTS idx_clips_saved_order
+		  ON clips(saved, created_at DESC, id DESC);
+		CREATE INDEX IF NOT EXISTS idx_clips_created_at
+		  ON clips(created_at DESC);
+		PRAGMA user_version=${SCHEMA_VERSION};
+	SQL
+}
+
+# FTS5 is not universally compiled in (Arch's sqlite has it; some minimal and
+# vendored builds do not), so it is created opportunistically and search
+# degrades to LIKE when the module is missing. The triggers reference
+# clips_fts, so they must not exist unless the module does — every insert
+# would fail otherwise.
+fts_schema() {
+	cat <<-'SQL'
+		.output /dev/null
+		PRAGMA busy_timeout=5000;
+		PRAGMA trusted_schema=ON;
+		.output stdout
+		CREATE VIRTUAL TABLE IF NOT EXISTS clips_fts USING fts5(
+		  searchable,
+		  content='clips',
+		  content_rowid='id',
+		  tokenize='porter unicode61 remove_diacritics 1'
+		);
+		CREATE TRIGGER IF NOT EXISTS clips_ai AFTER INSERT ON clips BEGIN
+		  INSERT INTO clips_fts(rowid, searchable) VALUES (new.id, new.searchable);
+		END;
+		CREATE TRIGGER IF NOT EXISTS clips_ad AFTER DELETE ON clips BEGIN
+		  INSERT INTO clips_fts(clips_fts, rowid, searchable)
+		  VALUES ('delete', old.id, old.searchable);
+		END;
+		CREATE TRIGGER IF NOT EXISTS clips_au AFTER UPDATE OF searchable ON clips BEGIN
+		  INSERT INTO clips_fts(clips_fts, rowid, searchable)
+		  VALUES ('delete', old.id, old.searchable);
+		  INSERT INTO clips_fts(rowid, searchable) VALUES (new.id, new.searchable);
+		END;
+		INSERT INTO clips_fts(clips_fts) VALUES('rebuild');
+	SQL
+}
+
+build_projections() {
+	local text_expr truncated_expr has_html_expr
+	text_expr="CASE WHEN c.text IS NULL THEN NULL
+	            WHEN length(c.text) > $LIST_TEXT_CHARS THEN substr(c.text, 1, $LIST_TEXT_CHARS)
+	            ELSE c.text END"
+	truncated_expr="CASE WHEN c.text IS NOT NULL AND length(c.text) > $LIST_TEXT_CHARS
+	                 THEN 'true' ELSE 'false' END"
+	# The HTML flavour itself never appears in a listing — one Wikipedia page
+	# is bigger than a whole page of clips. Callers get a boolean and ask
+	# `get` or `markdown` for the payload when the user actually wants it.
+	has_html_expr="CASE WHEN c.html IS NOT NULL AND c.html <> '' THEN 'true' ELSE 'false' END"
+
+	local template="json_object(
+	  'id',             c.id,
+	  'kind',           c.kind,
+	  'preview',        c.preview,
+	  'text',           %TEXT%,
+	  'text_truncated', json(%TRUNCATED%),
+	  'hash',           c.hash,
+	  'source_app',     c.source_app,
+	  'created_at',     c.created_at,
+	  'pinned',         json(CASE WHEN c.pinned THEN 'true' ELSE 'false' END),
+	  'saved',          json(CASE WHEN c.saved THEN 'true' ELSE 'false' END),
+	  'image_path',     c.image_path,
+	  'thumb_path',     c.thumb_path,
+	  'image_width',    c.image_width,
+	  'image_height',   c.image_height,
+	  'url_domain',     c.url_domain,
+	  'url_title',      c.url_title,
+	  'file_count',     c.file_count,
+	  'files',          CASE WHEN c.files_json IS NOT NULL AND json_valid(c.files_json)
+	                         THEN json(c.files_json) ELSE json('null') END,
+	  'mime',           c.mime,
+	  'size_bytes',     c.size_bytes,
+	  'has_html',       json($has_html_expr)%HTML%
+	)"
+
+	CLIP_JSON_LIST=${template/\%TEXT\%/$text_expr}
+	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%TRUNCATED\%/$truncated_expr}
+	CLIP_JSON_LIST=${CLIP_JSON_LIST/\%HTML\%/}
+	CLIP_JSON_FULL=${template/\%TEXT\%/c.text}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%TRUNCATED\%/\'false\'}
+	CLIP_JSON_FULL=${CLIP_JSON_FULL/\%HTML\%/,$'\n'"	  'html',           c.html"}
+}
+
+# Adds a column to an existing table, once. Checking pragma_table_info rather
+# than trusting user_version means a database that was hand-edited, restored
+# from a backup, or half-migrated by an interrupted run still converges.
+add_column() {
+	# $1 table, $2 column, $3 type
+	local present
+	present=$(printf "SELECT count(*) FROM pragma_table_info('%s') WHERE name = '%s';\n" "$1" "$2" |
+		run_raw 2>/dev/null) || present=''
+	[ "${present:-0}" = "0" ] || return 0
+	printf 'ALTER TABLE %s ADD COLUMN %s %s;\n' "$1" "$2" "$3" | run_raw >/dev/null 2>&1 ||
+		die "could not add $1.$2 to $DB_PATH"
+}
+
+# Brings an existing database up to SCHEMA_VERSION. Runs *before* base_schema,
+# because base_schema stamps PRAGMA user_version and would otherwise hide the
+# version this file is actually at. Additive only: no table is dropped or
+# rebuilt, so a history that is already on disk survives an upgrade untouched.
+migrate_schema() {
+	local from table_exists
+	[ -f "$DB_PATH" ] || return 0
+
+	table_exists=$(printf "SELECT count(*) FROM sqlite_master
+	                       WHERE type = 'table' AND name = 'clips';\n" |
+		run_raw 2>/dev/null) || table_exists=''
+	# No clips table yet: base_schema is about to create it at the current
+	# version, with every column already in place.
+	[ "${table_exists:-0}" = "1" ] || return 0
+
+	from=$(printf 'PRAGMA user_version;\n' | run_raw 2>/dev/null) || from=''
+	case "$from" in
+	'' | *[!0-9]*) from=0 ;;
+	esac
+
+	# v1 -> v2: the text/html clipboard flavour. Nullable, so every existing
+	# row is valid as it stands and simply reports has_html:false.
+	if [ "$from" -lt 2 ]; then
+		add_column clips html TEXT
+	fi
+}
+
+drop_fts_triggers() {
+	cat <<-'SQL' | run_raw
+		DROP TRIGGER IF EXISTS clips_ai;
+		DROP TRIGGER IF EXISTS clips_ad;
+		DROP TRIGGER IF EXISTS clips_au;
+	SQL
+}
+
+# Re-runs the FTS5 probe and rewrites the cached answer. `no FTS5` is only ever
+# true of the sqlite3 that answered it, so an upgraded (or newly built) sqlite3
+# has to be able to turn search back on without the user deleting state by hand.
+probe_fts() {
+	if fts_schema | run_raw >/dev/null 2>&1; then
+		FTS_ENABLED=1
+		write_stamp_marker "$FTS_ENABLED_STAMP"
+		safe_unlink "$STATE_DIR" "$FTS_DISABLED_STAMP"
+	else
+		FTS_ENABLED=0
+		drop_fts_triggers >/dev/null 2>&1 || true
+		write_stamp_marker "$FTS_DISABLED_STAMP"
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+	fi
+	# Remove the content-bearing legacy cache through unlinkat. If it was replaced
+	# with a symlink, this removes the link itself and never its target.
+	safe_unlink "$STATE_DIR" .fts
+}
+
+ensure_schema() {
+	# Pin before anything reads or writes, so even the fork-free fast path below
+	# resolves the database against the held directory rather than a pathname. A
+	# failure here just means the directory does not exist yet; the slow path
+	# creates it and pins afterwards.
+	pin_state_dir || true
+	set_stamp_prefix
+
+	local stamp_name=".schema-v$SCHEMA_VERSION" old_version
+
+	build_projections
+
+	# Fast path: no forks at all. A stamp file rather than PRAGMA user_version,
+	# because reading the pragma would itself cost a whole sqlite3 process on
+	# every keystroke.
+	if [ -f "$DB_PATH" ] && stamp_marker_present "$stamp_name"; then
+		# The production (Arch) fast path stays fork-free: marker existence carries
+		# the cached yes and no marker bytes are ever opened. A cached no is probed
+		# again so an upgraded sqlite3 can enable FTS without trusting mtime through
+		# a potentially substituted pathname.
+		if stamp_marker_present "$FTS_ENABLED_STAMP"; then
+			FTS_ENABLED=1
+			return 0
+		fi
+		probe_fts
+		return 0
+	fi
+
+	safe_ensure_dir "$STATE_DIR" 700
+	safe_ensure_dir "$IMAGE_DIR" 755
+	safe_ensure_dir "$THUMB_DIR" 755
+	refuse_symlink "$DB_PATH"
+	pin_state_dir || die "could not enter $STATE_DIR"
+	# Pinning may have just succeeded for the first time; marker existence checks
+	# below must use the form that reflects that.
+	set_stamp_prefix
+
+	migrate_schema
+	base_schema | run_raw >/dev/null || die "could not open or create $DB_PATH"
+
+	probe_fts
+	# The marker is per-version, so an upgraded binary always takes the slow path
+	# once and runs its migrations. Remove only the older names we know about,
+	# descriptor-relative; a glob could be traversal-shaped after substitution.
+	for ((old_version = 0; old_version < SCHEMA_VERSION; old_version++)); do
+		safe_unlink "$STATE_DIR" ".schema-v$old_version"
+	done
+	write_stamp_marker "$stamp_name"
+}
+
+# ---------------------------------------------------------------------------
+# filtering + search
+# ---------------------------------------------------------------------------
+
+filter_predicate() {
+	case "${1:-all}" in
+	all | '') REPLY_SQL='1' ;;
+	text) REPLY_SQL="c.kind = 'text'" ;;
+	url | link | links) REPLY_SQL="c.kind = 'url'" ;;
+	image | images) REPLY_SQL="c.kind = 'image'" ;;
+	files | file | file_list | fileList) REPLY_SQL="c.kind = 'files'" ;;
+	saved | bookmarked) REPLY_SQL='c.saved = 1' ;;
+	pinned) REPLY_SQL='c.pinned = 1' ;;
+	*) die "unknown filter: $1" ;;
+	esac
+}
+
+# Mirrors build_fts_query() in the Tauri app: split on non-alphanumerics, turn
+# every token into a prefix term, AND them together. Leaves REPLY_SQL empty
+# when the term yields no usable tokens, which is the caller's signal to use
+# the LIKE path instead. Case folding is left to the unicode61 tokenizer.
+fts_query_for() {
+	local cleaned=${1//[![:alnum:]]/ }
+	local token out=''
+	set -f
+	# shellcheck disable=SC2086
+	set -- $cleaned
+	set +f
+	# Every token is quoted, always. fts5 reads a bare AND/OR/NOT/NEAR as an
+	# operator, so searching for "NOT NULL" used to be a syntax error, which
+	# dropped the whole query to the LIKE path -- where the *tokenised* term no
+	# longer matched anything and the user saw an empty list. A quoted token is
+	# a string in every case; the tokens are alphanumeric by construction, so
+	# there is nothing inside them to escape.
+	for token in "$@"; do
+		out="${out:+$out AND }\"${token}\"*"
+	done
+	REPLY_SQL="$out"
+}
+
+like_pattern_for() {
+	local pattern=${1//\\/\\\\}
+	pattern=${pattern//%/\\%}
+	pattern=${pattern//_/\\_}
+	REPLY_SQL="%${pattern}%"
+}
+
+# Builds "FROM ... WHERE ..." into REPLY_SQL.
+# $1 filter, $2 query, $3 none|fts|like, $4 the cached FTS term (may be empty)
+from_where() {
+	local filter="$1" query="$2" mode="$3" fts_term="${4:-}" predicate
+	filter_predicate "$filter"
+	predicate="$REPLY_SQL"
+
+	case "$mode" in
+	none)
+		REPLY_SQL="FROM clips c WHERE $predicate"
+		;;
+	fts)
+		sql_quote "$fts_term"
+		REPLY_SQL="FROM clips c JOIN clips_fts ON clips_fts.rowid = c.id
+		           WHERE clips_fts MATCH $REPLY_QUOTED AND $predicate"
+		;;
+	*)
+		like_pattern_for "$query"
+		sql_quote "$REPLY_SQL"
+		REPLY_SQL="FROM clips c WHERE c.searchable LIKE $REPLY_QUOTED ESCAPE '\\' AND $predicate"
+		;;
+	esac
+}
+
+# Sets SEARCH_MODE and SEARCH_FTS_TERM for a query. FTS is preferred, but a
+# punctuation-only term tokenises to nothing and has to go through LIKE.
+SEARCH_MODE=none
+SEARCH_FTS_TERM=''
+plan_search() {
+	SEARCH_FTS_TERM=''
+	if [ -z "$1" ]; then
+		SEARCH_MODE=none
+		return 0
+	fi
+	if [ "$FTS_ENABLED" = "1" ]; then
+		fts_query_for "$1"
+		if [ -n "$REPLY_SQL" ]; then
+			SEARCH_FTS_TERM="$REPLY_SQL"
+			SEARCH_MODE=fts
+			return 0
+		fi
+	fi
+	SEARCH_MODE=like
+}
+
+# Wraps newline-delimited JSON objects into a JSON array.
+as_json_array() {
+	awk 'BEGIN { printf "[" } { printf "%s%s", (n++ ? "," : ""), $0 } END { printf "]\n" }'
+}
+
+# ---------------------------------------------------------------------------
+# subcommands
+# ---------------------------------------------------------------------------
+
+cmd_list() {
+	local limit=50 offset=0 filter=all query='' sql out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--limit)
+			require_count "${2:-}"
+			limit="$2"
+			shift 2
+			;;
+		--offset)
+			require_count "${2:-}"
+			offset="$2"
+			shift 2
+			;;
+		--filter)
+			filter="${2:-all}"
+			shift 2
+			;;
+		--query)
+			query="${2:-}"
+			shift 2
+			;;
+		*) die "list: unknown option $1" ;;
+		esac
+	done
+	[ "$limit" -gt 0 ] || limit=50
+
+	plan_search "$query"
+	from_where "$filter" "$query" "$SEARCH_MODE" "$SEARCH_FTS_TERM"
+	sql="SELECT $CLIP_JSON_LIST $REPLY_SQL
+	     ORDER BY c.pinned DESC, c.created_at DESC, c.id DESC
+	     LIMIT $limit OFFSET $offset;"
+
+	if [ "$SEARCH_MODE" != "fts" ]; then
+		run_sql "$sql" | as_json_array
+		return 0
+	fi
+
+	# FTS5 rejects some terms that survive tokenisation. Degrade to LIKE
+	# rather than surfacing a query error to the UI.
+	if out=$(run_sql "$sql" 2>/dev/null); then
+		printf '%s' "$out" | as_json_array
+		return 0
+	fi
+	from_where "$filter" "$query" like
+	sql="SELECT $CLIP_JSON_LIST $REPLY_SQL
+	     ORDER BY c.pinned DESC, c.created_at DESC, c.id DESC
+	     LIMIT $limit OFFSET $offset;"
+	run_sql "$sql" | as_json_array
+}
+
+cmd_get() {
+	local out
+	require_id "${1:-}"
+	out=$(run_sql "SELECT $CLIP_JSON_FULL FROM clips c WHERE c.id = $1;") || die "get failed"
+	if [ -z "$out" ]; then
+		printf 'null\n'
+	else
+		printf '%s\n' "$out"
+	fi
+}
+
+cmd_count() {
+	local filter=all query='' sql out
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--filter)
+			filter="${2:-all}"
+			shift 2
+			;;
+		--query)
+			query="${2:-}"
+			shift 2
+			;;
+		*) die "count: unknown option $1" ;;
+		esac
+	done
+
+	plan_search "$query"
+	from_where "$filter" "$query" "$SEARCH_MODE" "$SEARCH_FTS_TERM"
+	sql="SELECT json_object('total', (SELECT count(*) FROM clips),
+	                        'filtered', (SELECT count(*) $REPLY_SQL));"
+
+	if [ "$SEARCH_MODE" != "fts" ]; then
+		run_sql "$sql"
+		return 0
+	fi
+	if out=$(run_sql "$sql" 2>/dev/null) && [ -n "$out" ]; then
+		printf '%s\n' "$out"
+		return 0
+	fi
+	from_where "$filter" "$query" like
+	run_sql "SELECT json_object('total', (SELECT count(*) FROM clips),
+	                            'filtered', (SELECT count(*) $REPLY_SQL));"
+}
+
+# Rewrites $1 in place with every byte that is not valid UTF-8 removed.
+# SQLite stores whatever bytes it is given, json_object() hands them straight
+# back out, and QML's JSON.parse then rejects the *whole* page -- one clip
+# copied out of a latin-1 terminal used to blank the entire history.
+scrub_utf8() {
+	local clean
+	mktempfile
+	clean="$REPLY_TMPFILE"
+	# glibc's iconv exits 1 when -c dropped anything -- which is precisely the
+	# case this exists for -- so its status cannot gate the result. (macOS
+	# iconv exits 0 there, which is how a status-gated version passed its own
+	# test on a Mac and stripped every accented letter on Arch.) Trust the
+	# output whenever iconv ran at all and produced something from a non-empty
+	# input; fall back only when it is absent or failed outright.
+	if command -v iconv >/dev/null 2>&1; then
+		iconv -c -f UTF-8 -t UTF-8 <"$1" >"$clean" 2>/dev/null || true
+		if [ -s "$clean" ]; then
+			cat -- "$clean" >"$1"
+			return 0
+		fi
+	fi
+	# No iconv (a busybox or otherwise minimal userland): drop every byte
+	# outside ASCII rather than let an invalid sequence through. Lossy, but a
+	# readable clip beats an unparseable page.
+	LC_ALL=C tr -d '\200-\377' <"$1" >"$clean"
+	cat -- "$clean" >"$1"
+}
+
+cmd_insert() {
+	local payload sql out
+	mktempfile
+	payload="$REPLY_TMPFILE"
+	cat >"$payload"
+	[ -s "$payload" ] || die "insert: empty payload on stdin"
+	scrub_utf8 "$payload"
+	[ -s "$payload" ] || die "insert: empty payload on stdin"
+	sql_quote "$payload"
+
+	sql=$(
+		cat <<-SQL
+			CREATE TEMP TABLE p AS
+			SELECT
+			  kind,
+			  text,
+			  html,
+			  COALESCE(
+			    NULLIF(TRIM(preview_in), ''),
+			    NULLIF(
+			      CASE WHEN length(collapsed) > $PREVIEW_CHARS
+			           THEN substr(collapsed, 1, $PREVIEW_CHARS) || char(8230)
+			           ELSE collapsed END, ''),
+			    CASE kind WHEN 'image' THEN 'Image' WHEN 'files' THEN 'Files' ELSE '' END
+			  ) AS preview,
+			  -- Single line, always. The copy subcommand writes this hash to the
+			  -- suppression file and the watcher reads it back, so a char(10)
+			  -- in the fallback hash used to hand the watcher a truncated token
+			  -- and self-capture suppression silently stopped working. char(31)
+			  -- (unit separator) keeps the same shape without the newline.
+			  COALESCE(
+			    NULLIF(hash_in, ''),
+			    kind || char(31) || replace(replace(
+			      COALESCE(text, preview_in, ''), char(10), char(31)), char(13), char(31))
+			  ) AS hash,
+			  source_app,
+			  created_at,
+			  image_path,
+			  thumb_path,
+			  image_width,
+			  image_height,
+			  url_domain,
+			  url_title,
+			  CASE WHEN files_json IS NOT NULL AND json_valid(files_json) THEN files_json END AS files_json,
+			  COALESCE(
+			    file_count_in,
+			    CASE WHEN files_json IS NOT NULL AND json_valid(files_json)
+			         THEN json_array_length(files_json) END,
+			    0) AS file_count,
+			  mime,
+			  size_bytes
+			FROM (
+			  SELECT
+			    CASE WHEN json_extract(j, '\$.kind') IN ('text','url','image','files')
+			         THEN json_extract(j, '\$.kind') ELSE 'text' END       AS kind,
+			    json_extract(j, '\$.text')                                 AS text,
+			    NULLIF(json_extract(j, '\$.html'), '')                     AS html,
+			    COALESCE(json_extract(j, '\$.preview'), '')                AS preview_in,
+			    COALESCE(json_extract(j, '\$.hash'), '')                   AS hash_in,
+			    json_extract(j, '\$.source_app')                           AS source_app,
+			    COALESCE(json_extract(j, '\$.created_at'), unixepoch())    AS created_at,
+			    json_extract(j, '\$.image_path')                           AS image_path,
+			    json_extract(j, '\$.thumb_path')                           AS thumb_path,
+			    json_extract(j, '\$.image_width')                          AS image_width,
+			    json_extract(j, '\$.image_height')                         AS image_height,
+			    json_extract(j, '\$.url_domain')                           AS url_domain,
+			    json_extract(j, '\$.url_title')                            AS url_title,
+			    json_extract(j, '\$.files')                                AS files_json,
+			    json_extract(j, '\$.file_count')                           AS file_count_in,
+			    json_extract(j, '\$.mime')                                 AS mime,
+			    json_extract(j, '\$.size_bytes')                           AS size_bytes,
+			    TRIM(replace(replace(replace(
+			      COALESCE(json_extract(j, '\$.text'), ''),
+			      char(10), ' '), char(13), ' '), char(9), ' '))           AS collapsed
+			  FROM (SELECT CAST(readfile($REPLY_QUOTED) AS TEXT) AS j)
+			);
+
+			CREATE TEMP TABLE d AS
+			SELECT EXISTS (
+			  SELECT 1 FROM clips x JOIN p ON x.hash = p.hash
+			  WHERE abs(p.created_at - x.created_at) < $RECENT_DUPLICATE_WINDOW
+			) AS recent;
+
+			INSERT INTO clips (
+			  kind, preview, text, html, hash, source_app, created_at,
+			  image_path, thumb_path, image_width, image_height,
+			  url_domain, url_title, files_json, file_count, mime, size_bytes, searchable
+			)
+			SELECT
+			  p.kind, p.preview, p.text, p.html, p.hash, p.source_app, p.created_at,
+			  p.image_path, p.thumb_path, p.image_width, p.image_height,
+			  p.url_domain, p.url_title, p.files_json, p.file_count, p.mime, p.size_bytes,
+			  TRIM(
+			    COALESCE(p.text, '') || ' ' || p.preview || ' ' ||
+			    COALESCE(p.source_app, '') || ' ' || COALESCE(p.url_domain, '') || ' ' ||
+			    COALESCE(p.url_title, '') || ' ' || COALESCE(p.mime, '') || ' ' ||
+			    CASE WHEN p.kind = 'image'
+			         THEN 'image ' || COALESCE(p.image_width, '') || ' ' || COALESCE(p.image_height, '')
+			         ELSE '' END || ' ' ||
+			    COALESCE(replace(replace(replace(p.files_json, '"', ' '), '{', ' '), '}', ' '), '')
+			  )
+			FROM p
+			WHERE (SELECT recent FROM d) = 0
+			ON CONFLICT(hash) DO UPDATE SET
+			  kind         = excluded.kind,
+			  preview      = excluded.preview,
+			  text         = excluded.text,
+			  -- Not COALESCEd: the dedupe hash covers the plain text only, so
+			  -- a re-copy of the same text from a source that offers no HTML
+			  -- must clear the stale flavour rather than keep it.
+			  html         = excluded.html,
+			  source_app   = excluded.source_app,
+			  created_at   = excluded.created_at,
+			  image_path   = COALESCE(excluded.image_path, clips.image_path),
+			  thumb_path   = COALESCE(excluded.thumb_path, clips.thumb_path),
+			  image_width  = COALESCE(excluded.image_width, clips.image_width),
+			  image_height = COALESCE(excluded.image_height, clips.image_height),
+			  url_domain   = COALESCE(excluded.url_domain, clips.url_domain),
+			  url_title    = COALESCE(excluded.url_title, clips.url_title),
+			  files_json   = excluded.files_json,
+			  file_count   = excluded.file_count,
+			  mime         = COALESCE(excluded.mime, clips.mime),
+			  size_bytes   = COALESCE(excluded.size_bytes, clips.size_bytes),
+			  searchable   = excluded.searchable;
+
+			SELECT json_object(
+			  'id',      (SELECT id FROM clips WHERE hash = (SELECT hash FROM p)),
+			  'deduped', json(CASE WHEN (SELECT recent FROM d) = 1 THEN 'true' ELSE 'false' END)
+			);
+		SQL
+	)
+
+	out=$(run_sql "$sql") || die "insert failed (malformed payload?)"
+	[ -n "$out" ] || die "insert failed"
+	printf '%s\n' "$out"
+}
+
+cmd_flag() {
+	# $1 column, $2 id, $3 --on|--off
+	local column="$1" value
+	require_id "${2:-}"
+	case "${3:-}" in
+	--on | on | 1) value=1 ;;
+	--off | off | 0) value=0 ;;
+	*) die "$column: expected --on or --off" ;;
+	esac
+	run_sql "UPDATE clips SET $column = $value WHERE id = $2;" >/dev/null || die "$column failed"
+	printf '{"ok":true}\n'
+}
+
+# Collects the on-disk assets a doomed set of rows owns, deletes the rows, then
+# unlinks any asset no surviving row still references. Order matters: reading
+# after the DELETE would find nothing.
+#
+# The row count lands in REPLY_DELETED rather than on stdout: a `$(delete_where
+# ...)` caller would run the whole thing in a subshell, where the temp file it
+# registers for cleanup dies with the subshell and is never unlinked.
+REPLY_DELETED=0
+delete_where() {
+	local predicate="$1" doomed out count hexline asset asset_dir asset_name q_doomed
+	mktempfile
+	doomed="$REPLY_TMPFILE"
+	sql_quote "$doomed"
+	q_doomed="$REPLY_QUOTED"
+
+	# One sqlite3, not one per asset. The old shape asked "is anything else
+	# still pointing at this file?" in its own process for every doomed row,
+	# which is ~13 s to clear a thousand image clips; EXCEPT answers the same
+	# question for the whole set in a single statement, after the DELETE.
+	#
+	# The survivors come back hex-encoded, one per line, because a path is
+	# allowed to contain a newline and a line-delimited list would silently
+	# never unlink it. hex() output is [0-9A-F] and nothing else.
+	out=$(run_sql "
+	  CREATE TEMP TABLE doomed AS
+	    SELECT image_path AS path FROM clips WHERE ($predicate) AND image_path IS NOT NULL
+	    UNION
+	    SELECT thumb_path FROM clips WHERE ($predicate) AND thumb_path IS NOT NULL;
+	  DELETE FROM clips WHERE $predicate;
+	  SELECT changes();
+	  SELECT writefile($q_doomed, COALESCE((
+	    SELECT group_concat(hex(path), char(10)) FROM (
+	      SELECT path FROM doomed
+	      EXCEPT SELECT image_path FROM clips WHERE image_path IS NOT NULL
+	      EXCEPT SELECT thumb_path FROM clips WHERE thumb_path IS NOT NULL)), ''));
+	  ") || die "delete failed"
+	# changes() is printed first; writefile()'s byte count follows it.
+	count=${out%%$'\n'*}
+
+	if [ -s "$doomed" ]; then
+		while IFS= read -r hexline || [ -n "$hexline" ]; do
+			[ -n "$hexline" ] || continue
+			hex_decode "$hexline"
+			asset="$REPLY_SQL"
+			# A prefix glob also matches traversal-shaped values such as
+			# images/../../precious. Require an exact direct parent, then unlink the
+			# single component through the verified directory descriptor. A planted
+			# symlink is removed as a link and is never followed.
+			asset_dir=${asset%/*}
+			asset_name=${asset##*/}
+			case "$asset_name" in '' | . | ..) continue ;; esac
+			case "$asset_dir" in
+			"$IMAGE_DIR") safe_unlink "$IMAGE_DIR" "$asset_name" ;;
+			"$THUMB_DIR") safe_unlink "$THUMB_DIR" "$asset_name" ;;
+			esac
+		done <"$doomed"
+	fi
+
+	REPLY_DELETED="${count:-0}"
+}
+
+cmd_delete() {
+	require_id "${1:-}"
+	delete_where "id = $1"
+	printf '{"ok":true}\n'
+}
+
+cmd_clear() {
+	local predicate='pinned = 0 AND saved = 0' deleted
+	if [ "${1:-}" = "--all" ]; then
+		predicate='1'
+	fi
+	delete_where "$predicate"
+	deleted="$REPLY_DELETED"
+	printf '{"ok":true,"deleted":%s}\n' "$deleted"
+}
+
+cmd_prune() {
+	local max='' deleted
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--max)
+			require_count "${2:-}"
+			max="$2"
+			shift 2
+			;;
+		*) die "prune: unknown option $1" ;;
+		esac
+	done
+	[ -n "$max" ] || die "prune: --max N is required"
+
+	# Pinned and saved clips are exempt from the rolling cap and do not count
+	# against it, so "keep 200" means 200 unpinned/unsaved clips plus however
+	# many the user explicitly kept.
+	delete_where "id IN (
+	    SELECT id FROM clips WHERE pinned = 0 AND saved = 0
+	    ORDER BY created_at DESC, id DESC
+	    LIMIT -1 OFFSET $max
+	  )"
+	deleted="$REPLY_DELETED"
+	printf '{"deleted":%s}\n' "$deleted"
+}
+
+# Bumps a clip to the top of the history, the way re-copying it would.
+cmd_touch() {
+	require_id "${1:-}"
+	run_sql "UPDATE clips SET created_at = unixepoch() WHERE id = $1;" >/dev/null || die "touch failed"
+	printf '{"ok":true}\n'
+}
+
+# Arms one-shot self-capture suppression for a hash. The capture watcher
+# consumes the token on its next matching event.
+cmd_suppress() {
+	local hash="${1:-}"
+	[ -n "$hash" ] || die "suppress: expected a hash"
+	safe_ensure_dir "$STATE_DIR" 700
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600 4096
+	printf '{"ok":true}\n'
+}
+
+# Puts a clip back on the Wayland clipboard. This is the paired write to the
+# capture watcher's read, so it arms suppression and bumps the clip itself
+# rather than waiting for the echo to come back around.
+cmd_copy() {
+	local kind='' hash='' image_path='' image_name='' mime='' payload hash_file path_file mime_file
+	local q_hash q_path q_mime q_payload copy_rc=0
+	require_id "${1:-}"
+	command -v "$WL_COPY_BIN" >/dev/null 2>&1 || die "wl-copy is not installed"
+
+	# Nothing is packed into one row with a separator any more. sqlite3's -list
+	# output caret-escapes control characters -- char(31) comes back as the two
+	# printable bytes "^_" -- so a packed row never splits, `kind` swallowed the
+	# whole line, and every clip fell through to the plain-text branch: clicking
+	# Copy on an image put the string "Image 300x300" on the clipboard, which
+	# the watcher then recorded as a brand new text clip.
+	#
+	# `kind` is safe to read back as text because it is one of four literals.
+	# Everything else goes through writefile(), which writes raw bytes.
+	kind=$(run_sql "SELECT kind FROM clips WHERE id = $1;") || die "copy failed"
+	[ -n "$kind" ] || die "no clip with id $1"
+
+	mktempfile
+	hash_file="$REPLY_TMPFILE"
+	mktempfile
+	path_file="$REPLY_TMPFILE"
+	mktempfile
+	mime_file="$REPLY_TMPFILE"
+	sql_quote "$hash_file"
+	q_hash="$REPLY_QUOTED"
+	sql_quote "$path_file"
+	q_path="$REPLY_QUOTED"
+	sql_quote "$mime_file"
+	q_mime="$REPLY_QUOTED"
+
+	run_sql "SELECT writefile($q_hash, COALESCE(hash, '')),
+	                writefile($q_path, COALESCE(image_path, '')),
+	                writefile($q_mime, COALESCE(mime, ''))
+	         FROM clips WHERE id = $1;" >/dev/null || die "copy failed"
+	# Read to EOF, not to the first newline: the fallback hash is single-line by
+	# construction now, but a hand-written row's is whatever somebody put there,
+	# and a token truncated at a newline silently disarms self-capture
+	# suppression -- the clip comes straight back in as a brand new one.
+	IFS= read -r -d '' hash <"$hash_file" || true
+	IFS= read -r -d '' image_path <"$path_file" || true
+	IFS= read -r -d '' mime <"$mime_file" || true
+	hash=${hash%$'\n'}
+	image_path=${image_path%$'\n'}
+	mime=${mime%$'\n'}
+
+	if [ "$kind" = image ]; then
+		[ -n "$image_path" ] || die "clip $1 has no image on disk"
+		image_name=${image_path##*/}
+		# Stored rows are untrusted input (`insert` is public). Only a direct child
+		# of our image directory is a Clipbasket asset; a prefix-only check would
+		# accept traversal components such as ../.
+		[ "${image_path%/*}" = "$IMAGE_DIR" ] ||
+			die "clip $1 has an image path outside $IMAGE_DIR"
+		case "$image_name" in '' | . | ..) die "clip $1 has an invalid image name" ;; esac
+	fi
+
+	safe_ensure_dir "$STATE_DIR" 700
+	printf '%s\n' "$hash" | safe_write "$STATE_DIR" suppress 600 4096
+
+	mktempfile
+	payload="$REPLY_TMPFILE"
+	sql_quote "$payload"
+	q_payload="$REPLY_QUOTED"
+
+	case "$kind" in
+	image)
+		# Both the directory walk and the asset open are descriptor-bound and
+		# O_NOFOLLOW. A symlink planted at images/<hash> therefore yields no bytes
+		# to wl-copy instead of exfiltrating whatever it points at.
+		"$SAFEFILE" read "$IMAGE_DIR" "$image_name" |
+			"$WL_COPY_BIN" --type "${mime:-image/png}" || copy_rc=$?
+		[ "$copy_rc" -eq 0 ] || die "clip $1 image asset could not be read safely"
+		;;
+	files)
+		# A text/uri-list carries URIs, not paths: a space or a '%' in a file
+		# name has to be percent-encoded on the way out or the receiving app
+		# gets a different path back -- and clipbasket-capture, which decodes
+		# what it is handed, hashes a re-copied list to something that no
+		# longer matches the clip it came from. hex() keeps the paths intact
+		# across the shell (a path may contain a newline); the encoder maps
+		# each byte to the RFC 3986 unreserved set, leaving '/' alone.
+		local hexes hexline uris=''
+		hexes=$(run_sql "SELECT hex(json_extract(value, '\$.path'))
+		                 FROM clips, json_each(clips.files_json)
+		                 WHERE clips.id = $1;") || die "copy failed"
+		while IFS= read -r hexline || [ -n "$hexline" ]; do
+			[ -n "$hexline" ] || continue
+			hex_to_uri_path "$hexline"
+			uris="${uris}file://${REPLY_SQL}"$'\n'
+		done <<<"$hexes"
+		uris=${uris%$'\n'}
+		[ -n "$uris" ] || die "clip $1 has no file paths"
+		printf '%s' "$uris" >"$payload"
+		"$WL_COPY_BIN" --type text/uri-list <"$payload" || die "wl-copy failed"
+		;;
+	*)
+		run_sql "SELECT writefile($q_payload, COALESCE(text, preview)) FROM clips WHERE id = $1;" \
+			>/dev/null || die "copy failed"
+		"$WL_COPY_BIN" --type 'text/plain;charset=utf-8' <"$payload" || die "wl-copy failed"
+		;;
+	esac
+
+	run_sql "UPDATE clips SET created_at = unixepoch() WHERE id = $1;" >/dev/null || true
+	printf '{"ok":true}\n'
+}
+
+# Renders a clip's HTML flavour as GitHub-Flavored Markdown -- the Linux half of
+# what ClipDetailSheet does with turndown in the Tauri app. The conversion is
+# done by bin/clipbasket-html2md, and the result comes back through the database
+# so json_object() does the escaping rather than a hand-rolled encoder.
+cmd_markdown() {
+	local id base='' has html_file md_file out q_html q_md
+	require_id "${1:-}"
+	id="$1"
+	shift
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--base-url)
+			base="${2:-}"
+			shift 2
+			;;
+		*) die "markdown: unknown option $1" ;;
+		esac
+	done
+	[ -x "$HTML2MD" ] || die "clipbasket-html2md is not executable at $HTML2MD"
+
+	has=$(run_sql "SELECT CASE WHEN html IS NOT NULL AND html <> '' THEN 1 ELSE 0 END
+	               FROM clips WHERE id = $id;") || die "markdown failed"
+	[ -n "$has" ] || die "no clip with id $id"
+	[ "$has" = "1" ] || die "clip $id has no HTML flavour to convert"
+
+	mktempfile
+	html_file="$REPLY_TMPFILE"
+	sql_quote "$html_file"
+	q_html="$REPLY_QUOTED"
+	run_sql "SELECT writefile($q_html, html) FROM clips WHERE id = $id;" >/dev/null ||
+		die "markdown failed"
+
+	# A link clip's own URL is the right base for the relative hrefs the page's
+	# HTML is full of. Guarded in SQL so a multi-line or non-URL text can never
+	# reach the converter's --base-url.
+	if [ -z "$base" ]; then
+		base=$(run_sql "SELECT COALESCE(CASE WHEN kind = 'url' AND instr(text, '://') > 0
+		                                     AND instr(text, char(10)) = 0
+		                                THEN text END, '')
+		                FROM clips WHERE id = $id;") || base=''
+	fi
+
+	mktempfile
+	md_file="$REPLY_TMPFILE"
+	if [ -n "$base" ]; then
+		"$HTML2MD" --base-url "$base" <"$html_file" >"$md_file" || die "markdown conversion failed"
+	else
+		"$HTML2MD" <"$html_file" >"$md_file" || die "markdown conversion failed"
+	fi
+
+	sql_quote "$md_file"
+	q_md="$REPLY_QUOTED"
+	out=$(run_sql "SELECT json_object('markdown', COALESCE(CAST(readfile($q_md) AS TEXT), ''));") ||
+		die "markdown failed"
+	[ -n "$out" ] || die "markdown failed"
+	printf '%s\n' "$out"
+}
+
+cmd_info() {
+	local total fts
+	# `info` is the diagnostic, so it never reports a stale "no FTS5": it pays
+	# for a fresh probe rather than repeating a cached answer that a sqlite3
+	# upgrade may already have made wrong.
+	[ "$FTS_ENABLED" = "1" ] || probe_fts
+	total=$(run_sql "SELECT count(*) FROM clips;") || total=0
+	if [ "$FTS_ENABLED" = "1" ]; then fts=true; else fts=false; fi
+	printf '{"app":%s,"db":%s,"state_dir":%s,"schema_version":%s,"fts5":%s,"clips":%s,"sqlite":%s}\n' \
+		"$(json_string "$APP_NAME")" "$(json_string "$DB_PATH")" "$(json_string "$STATE_DIR")" \
+		"$SCHEMA_VERSION" "$fts" "${total:-0}" \
+		"$(json_string "$("$SQLITE_BIN" --version 2>/dev/null | cut -d' ' -f1)")"
+}
+
+# ---------------------------------------------------------------------------
+# selftest
+# ---------------------------------------------------------------------------
+
+cmd_selftest() {
+	local pass=0 fail=0 out ids page2 id1 id2 id3 big t0 t1
+
+	# Deliberately not `local`: the EXIT trap runs after this function's scope
+	# is gone and still has to find the directory it must remove.
+	# Resolved with -P: on macOS $TMPDIR sits under /var, which is a symlink,
+	# and clipbasket-safefile refuses to walk through one -- correctly. Harness
+	# fix only; the rule the helper enforces is unchanged.
+	SELFTEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/clipbasket-selftest.XXXXXX")
+	SELFTEST_ROOT=$(CDPATH='' cd -P -- "$SELFTEST_ROOT" && pwd -P)
+	selftest_cleanup() {
+		rm -rf "${SELFTEST_ROOT:-}"
+		cleanup
+	}
+	trap selftest_cleanup EXIT
+	trap 'selftest_cleanup; trap - INT; kill -s INT $$' INT
+	trap 'selftest_cleanup; trap - TERM; kill -s TERM $$' TERM
+
+	STATE_DIR="$SELFTEST_ROOT"
+	DB_PATH="$SELFTEST_ROOT/clips.db"
+	IMAGE_DIR="$SELFTEST_ROOT/images"
+	THUMB_DIR="$SELFTEST_ROOT/thumbs"
+	SUPPRESS_FILE="$SELFTEST_ROOT/suppress"
+	ensure_schema
+
+	check() {
+		# $1 label, $2 expected, $3 actual
+		if [ "$2" = "$3" ]; then
+			pass=$((pass + 1))
+			printf 'PASS  %s\n' "$1"
+		else
+			fail=$((fail + 1))
+			printf 'FAIL  %s\n        expected: %s\n        actual:   %s\n' "$1" "$2" "$3"
+		fi
+	}
+
+	check_contains() {
+		case "$3" in
+		*"$2"*)
+			pass=$((pass + 1))
+			printf 'PASS  %s\n' "$1"
+			;;
+		*)
+			fail=$((fail + 1))
+			printf 'FAIL  %s\n        wanted substring: %s\n        actual:   %s\n' "$1" "$2" "$3"
+			;;
+		esac
+	}
+
+	# The v1 schema, verbatim, so the migration is exercised against what is
+	# actually on a user's disk rather than against base_schema minus a column.
+	legacy_v1_schema() {
+		cat <<-'SQL'
+			CREATE TABLE IF NOT EXISTS clips (
+			  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			  kind         TEXT    NOT NULL,
+			  preview      TEXT    NOT NULL DEFAULT '',
+			  text         TEXT,
+			  hash         TEXT    NOT NULL UNIQUE,
+			  source_app   TEXT,
+			  created_at   INTEGER NOT NULL,
+			  pinned       INTEGER NOT NULL DEFAULT 0,
+			  saved        INTEGER NOT NULL DEFAULT 0,
+			  image_path   TEXT,
+			  thumb_path   TEXT,
+			  image_width  INTEGER,
+			  image_height INTEGER,
+			  url_domain   TEXT,
+			  url_title    TEXT,
+			  file_count   INTEGER NOT NULL DEFAULT 0,
+			  files_json   TEXT,
+			  mime         TEXT,
+			  size_bytes   INTEGER,
+			  searchable   TEXT    NOT NULL DEFAULT ''
+			);
+			PRAGMA user_version=1;
+		SQL
+	}
+
+	column_count() {
+		# $1 column name
+		printf "SELECT count(*) FROM pragma_table_info('clips') WHERE name = '%s';\n" "$1" | run_raw
+	}
+
+	# Upgrading a database that already holds the user's history is the one
+	# migration step that cannot be re-run, so it gets its own sandbox rather
+	# than borrowing the main selftest database.
+	selftest_migration() {
+		local legacy="$SELFTEST_ROOT/legacy" out
+		local keep_state="$STATE_DIR" keep_db="$DB_PATH" keep_img="$IMAGE_DIR"
+		local keep_thumb="$THUMB_DIR" keep_fts="$FTS_ENABLED"
+
+		mkdir -p "$legacy"
+		STATE_DIR="$legacy"
+		DB_PATH="$legacy/clips.db"
+		IMAGE_DIR="$legacy/images"
+		THUMB_DIR="$legacy/thumbs"
+
+		legacy_v1_schema | run_raw >/dev/null
+		run_raw >/dev/null <<-'SQL'
+			INSERT INTO clips (kind, preview, text, hash, created_at, saved, searchable)
+			VALUES ('text', 'old clip', 'old clip body', 'h-legacy', 1700000000, 1, 'old clip body'),
+			       ('url',  'example.com', 'https://example.com/', 'h-legacy-url', 1700000001, 0, 'example.com');
+		SQL
+		check 'a v1 database has no html column' '0' "$(column_count html)"
+		check 'a v1 database reports user_version 1' '1' \
+			"$(printf 'PRAGMA user_version;\n' | run_raw)"
+
+		ensure_schema
+
+		check 'migration adds html to the existing table' '1' "$(column_count html)"
+		check 'migration stamps the new schema version' "$SCHEMA_VERSION" \
+			"$(printf 'PRAGMA user_version;\n' | run_raw)"
+		check 'migration keeps every existing row' '2' "$(run_sql 'SELECT count(*) FROM clips;')"
+		check 'migration keeps the row contents byte for byte' 'old clip body' \
+			"$(run_sql "SELECT text FROM clips WHERE hash = 'h-legacy';")"
+		check 'migration keeps the saved flag' '1' \
+			"$(run_sql "SELECT saved FROM clips WHERE hash = 'h-legacy';")"
+		check 'migration keeps the id sequence' '2' \
+			"$(run_sql "SELECT id FROM clips WHERE hash = 'h-legacy-url';")"
+		out=$(cmd_list --limit 10)
+		check_contains 'a migrated row reports has_html false' '"has_html":false' "$out"
+
+		# Re-running the migration must be a no-op, not a duplicate-column error.
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
+		ensure_schema
+		check 'migrating an already-migrated database is a no-op' '1' "$(column_count html)"
+
+		printf '{"kind":"text","text":"after","hash":"h-legacy-new","html":"<p>after</p>"}\n' |
+			cmd_insert >/dev/null
+		out=$(cmd_list --limit 10 --query after)
+		check_contains 'a migrated database accepts html on new clips' '"has_html":true' "$out"
+
+		STATE_DIR="$keep_state"
+		DB_PATH="$keep_db"
+		IMAGE_DIR="$keep_img"
+		THUMB_DIR="$keep_thumb"
+		FTS_ENABLED="$keep_fts"
+	}
+
+	printf 'clipbasket-db selftest\n'
+	printf '  sqlite3: %s\n' "$("$SQLITE_BIN" --version 2>/dev/null | cut -d' ' -f1)"
+	printf '  fts5:    %s\n' "$([ "$FTS_ENABLED" = 1 ] && printf yes || printf 'no (LIKE fallback)')"
+	printf '  html2md: %s\n' "$([ -x "$HTML2MD" ] && printf '%s' "$HTML2MD" || printf 'missing!')"
+	printf '  db:      %s\n\n' "$DB_PATH"
+
+	selftest_migration
+
+	local nasty="line one
+line 'two' with \"quotes\" and a backslash \\ and 100% of _underscores_
+tab	here"
+
+	# --- insert -----------------------------------------------------------
+	out=$(printf '{"kind":"text","text":%s,"preview":"pathological","hash":"h-nasty","source_app":"Selftest"}\n' \
+		"$(json_string "$nasty")" | cmd_insert)
+	check_contains 'insert accepts pathological text' '"deduped":false' "$out"
+	id1=$(printf '%s' "$out" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+	check 'insert returns an id' '1' "$id1"
+
+	out=$(printf '{"kind":"url","text":"https://www.example.com/a/b?x=1","preview":"example.com/a/b?x=1","hash":"h-url","url_domain":"example.com","source_app":"Firefox"}\n' | cmd_insert)
+	id2=$(printf '%s' "$out" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+	out=$(printf '{"kind":"image","preview":"Image 800x600","hash":"h-img","image_path":"%s/h-img.png","thumb_path":"%s/h-img.png","image_width":800,"image_height":600,"mime":"image/png","size_bytes":4242}\n' \
+		"$IMAGE_DIR" "$THUMB_DIR" | cmd_insert)
+	id3=$(printf '%s' "$out" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+	: >"$IMAGE_DIR/h-img.png"
+	: >"$THUMB_DIR/h-img.png"
+	printf '{"kind":"files","preview":"a.txt, b.txt","hash":"h-files","files":[{"path":"/tmp/a.txt","name":"a.txt"},{"path":"/tmp/b.txt","name":"b.txt"}]}\n' | cmd_insert >/dev/null
+
+	# --- dedupe -----------------------------------------------------------
+	out=$(printf '{"kind":"text","text":"whatever","hash":"h-nasty"}\n' | cmd_insert)
+	check_contains 'consecutive duplicate is collapsed' '"deduped":true' "$out"
+	check_contains 'duplicate returns the original id' "\"id\":$id1" "$out"
+	check 'a collapsed duplicate does not overwrite the original' 'pathological' \
+		"$(run_sql "SELECT preview FROM clips WHERE hash = 'h-nasty';")"
+
+	# created_at has one-second resolution, so age every existing clip before
+	# re-inserting: otherwise the bumped clip ties with its neighbours and the
+	# id tiebreak decides, which is real behaviour but not what is under test.
+	run_sql "UPDATE clips SET created_at = created_at - 100000;" >/dev/null
+	out=$(printf '{"kind":"text","text":%s,"preview":"pathological","hash":"h-nasty"}\n' \
+		"$(json_string "$nasty")" | cmd_insert)
+	check_contains 'stale duplicate is re-recorded, not ignored' '"deduped":false' "$out"
+	out=$(cmd_list --limit 1)
+	check_contains 'stale duplicate moves back to the top' '"hash":"h-nasty"' "$out"
+
+	out=$(cmd_count)
+	check 'count reports 4 clips' '{"total":4,"filtered":4}' "$out"
+
+	# --- round-trip fidelity ---------------------------------------------
+	out=$(cmd_get "$id1")
+	check_contains 'get returns full text verbatim' "$(json_string "$nasty" | sed 's/^"//;s/"$//')" "$out"
+	check_contains 'get emits real JSON booleans' '"pinned":false' "$out"
+	out=$(cmd_get 999999)
+	check 'get on a missing id returns null' 'null' "$out"
+
+	# --- list, filters ----------------------------------------------------
+	out=$(cmd_list --limit 50 --filter url)
+	check_contains 'filter=url selects url clips' '"hash":"h-url"' "$out"
+	check 'filter=url excludes other kinds' '1' \
+		"$(printf '%s' "$out" | grep -o '"kind":"url"' | wc -l | tr -d ' ')"
+	out=$(cmd_list --limit 50 --filter image)
+	check_contains 'filter=image selects image clips' '"image_width":800' "$out"
+	out=$(cmd_list --limit 50 --filter files)
+	check_contains 'filter=files keeps the file array' '"path":"/tmp/a.txt"' "$out"
+	check_contains 'filter=files sets file_count' '"file_count":2' "$out"
+	out=$(cmd_list --limit 50 --filter text)
+	check_contains 'filter=text selects text clips' '"hash":"h-nasty"' "$out"
+
+	out=$(cmd_list --limit 0 --filter all)
+	check 'list --limit 0 falls back to the default page' '4' \
+		"$(printf '%s' "$out" | grep -o '"id":' | wc -l | tr -d ' ')"
+	out=$(cmd_list --limit 2)
+	check 'list --limit caps the page' '2' \
+		"$(printf '%s' "$out" | grep -o '"id":' | wc -l | tr -d ' ')"
+	ids=" $(printf '%s' "$out" | grep -o '"id":[0-9]*' | tr '\n' ' ')"
+	out=$(cmd_list --limit 2 --offset 2)
+	page2=" $(printf '%s' "$out" | grep -o '"id":[0-9]*' | head -1) "
+	case "$ids" in
+	*"$page2"*) check 'list --offset returns a disjoint page' 'disjoint' 'overlap' ;;
+	*) check 'list --offset returns a disjoint page' 'disjoint' 'disjoint' ;;
+	esac
+
+	out=$(cmd_list --limit 50 --filter saved)
+	check 'filter=saved is empty before saving' '[]' "$out"
+
+	# --- pin / save -------------------------------------------------------
+	out=$(cmd_flag pinned "$id2" --on)
+	check 'pin --on' '{"ok":true}' "$out"
+	out=$(cmd_list --limit 1)
+	check_contains 'pinned clip floats to the top' '"hash":"h-url"' "$out"
+	check_contains 'pinned is a JSON true' '"pinned":true' "$out"
+	out=$(cmd_flag pinned "$id2" --off)
+	check 'pin --off' '{"ok":true}' "$out"
+
+	out=$(cmd_flag saved "$id2" --on)
+	check 'save --on' '{"ok":true}' "$out"
+	out=$(cmd_list --limit 50 --filter saved)
+	check_contains 'filter=saved finds it' '"hash":"h-url"' "$out"
+
+	# --- search -----------------------------------------------------------
+	out=$(cmd_list --limit 50 --query 'example')
+	check_contains 'search matches the url domain' '"hash":"h-url"' "$out"
+	out=$(cmd_list --limit 50 --query 'Firefox')
+	check_contains 'search matches source_app' '"hash":"h-url"' "$out"
+	out=$(cmd_list --limit 50 --query 'firefox')
+	check_contains 'search is case-insensitive' '"hash":"h-url"' "$out"
+	out=$(cmd_list --limit 50 --query 'exam')
+	check_contains 'search matches on a prefix' '"hash":"h-url"' "$out"
+	out=$(cmd_list --limit 50 --query 'nothingmatchesthis')
+	check 'search with no hits returns []' '[]' "$out"
+	out=$(cmd_list --limit 50 --query "'; DROP TABLE clips; --")
+	check 'sql injection in --query is inert' '[]' "$out"
+	out=$(cmd_count)
+	check 'clips table survived the injection attempt' '{"total":4,"filtered":4}' "$out"
+	out=$(cmd_list --limit 50 --query 'pathologi%al')
+	check 'a LIKE wildcard in the query is escaped, not expanded' '[]' "$out"
+	out=$(cmd_list --limit 50 --query 'pathological')
+	check_contains 'the same query without the wildcard does match' '"preview":"pathological"' "$out"
+	out=$(cmd_count --query example)
+	check_contains 'count honours --query' '"filtered":1' "$out"
+	out=$(cmd_count --filter image)
+	check 'count honours --filter' '{"total":4,"filtered":1}' "$out"
+
+	# --- huge payload -----------------------------------------------------
+	mktempfile
+	big="$REPLY_TMPFILE"
+	{
+		printf '{"kind":"text","hash":"h-big","preview":"big","text":"'
+		awk 'BEGIN { for (i = 0; i < 60000; i++) printf "abcdefghij" }'
+		printf '"}\n'
+	} >"$big"
+	out=$(cmd_insert <"$big")
+	check_contains 'insert handles a 600KB payload' '"deduped":false' "$out"
+	out=$(cmd_list --limit 50 --filter text)
+	check_contains 'list truncates long text' '"text_truncated":true' "$out"
+	check '600KB payload round-trips in full' '600000' \
+		"$(run_sql "SELECT length(text) FROM clips WHERE hash = 'h-big';")"
+	out=$(cmd_get "$(run_sql "SELECT id FROM clips WHERE hash = 'h-big';")")
+	check_contains 'get marks full text as untruncated' '"text_truncated":false' "$out"
+
+	# --- prune ------------------------------------------------------------
+	out=$(cmd_prune --max 100)
+	check 'prune under the cap deletes nothing' '{"deleted":0}' "$out"
+	out=$(cmd_prune --max 2)
+	check 'prune trims to the cap' '{"deleted":2}' "$out"
+	out=$(cmd_count)
+	check 'prune spares the saved clip' '{"total":3,"filtered":3}' "$out"
+	check 'prune unlinked the orphaned image asset' 'gone' \
+		"$([ -f "$IMAGE_DIR/h-img.png" ] && printf present || printf gone)"
+
+	# --- delete / clear ---------------------------------------------------
+	out=$(cmd_delete "$id3")
+	check 'delete' '{"ok":true}' "$out"
+	out=$(cmd_clear)
+	check_contains 'clear keeps saved clips' '"ok":true' "$out"
+	out=$(cmd_count)
+	check 'only the saved clip survived clear' '{"total":1,"filtered":1}' "$out"
+	out=$(cmd_clear --all)
+	check_contains 'clear --all empties everything' '"ok":true' "$out"
+	out=$(cmd_count)
+	check 'database is empty' '{"total":0,"filtered":0}' "$out"
+	out=$(cmd_list --limit 10)
+	check 'list on an empty database returns []' '[]' "$out"
+
+	# --- extensions -------------------------------------------------------
+	printf '{"kind":"text","text":"touch me","hash":"h-touch","created_at":1}\n' | cmd_insert >/dev/null
+	id1=$(run_sql "SELECT id FROM clips WHERE hash = 'h-touch';")
+	cmd_touch "$id1" >/dev/null
+	check 'touch bumps created_at to now' 'now' \
+		"$(run_sql "SELECT CASE WHEN created_at > 1000000 THEN 'now' ELSE 'old' END
+		            FROM clips WHERE id = $id1;")"
+	out=$(cmd_suppress deadbeef)
+	check 'suppress writes a token' '{"ok":true}' "$out"
+	check 'suppress token is readable by the watcher' 'deadbeef' "$(cat "$SUPPRESS_FILE")"
+	out=$(cmd_info)
+	check_contains 'info reports the schema version' '"schema_version":2' "$out"
+
+	# --- error handling ---------------------------------------------------
+	out=$(cmd_get abc 2>/dev/null) || true
+	check_contains 'a bad id is a JSON error, not a crash' '"error"' "$out"
+	out=$(printf 'not json at all\n' | cmd_insert 2>/dev/null) || true
+	check_contains 'a malformed payload is a JSON error' '"error"' "$out"
+	out=$(cmd_list --filter nope 2>/dev/null) || true
+	check_contains 'an unknown filter is a JSON error' '"error"' "$out"
+	out=$(cmd_flag pinned 1 --maybe 2>/dev/null) || true
+	check_contains 'pin without --on/--off is a JSON error' '"error"' "$out"
+
+	# --- the html flavour and the markdown pipeline -----------------------
+	local html_payload id_html
+	mktempfile
+	html_payload="$REPLY_TMPFILE"
+	cat >"$html_payload" <<-'JSON'
+		{"kind":"text","preview":"Heading","hash":"h-html",
+		 "text":"Heading\none\nlink",
+		 "html":"<h1>Heading</h1><ul><li>one</li></ul><table><thead><tr><th>K</th></tr></thead><tbody><tr><td>v</td></tr></tbody></table><p><a href=\"/rel\">link</a></p>"}
+	JSON
+	cmd_insert <"$html_payload" >/dev/null
+	id_html=$(run_sql "SELECT id FROM clips WHERE hash = 'h-html';")
+
+	out=$(cmd_list --limit 10 --filter text)
+	check_contains 'list flags a clip that carries html' '"has_html":true' "$out"
+	check 'list never ships the html itself' '0' \
+		"$(printf '%s' "$out" | grep -o '"html":' | wc -l | tr -d ' ')"
+	out=$(cmd_list --limit 10 --query 'touch me')
+	check_contains 'a clip without html reports has_html false' '"has_html":false' "$out"
+
+	out=$(cmd_get "$id_html")
+	check_contains 'get reports has_html' '"has_html":true' "$out"
+	check_contains 'get returns the html flavour verbatim' '<h1>Heading</h1>' "$out"
+	check_contains 'the plain text is still the clip text' '"text":"Heading' "$out"
+
+	out=$(cmd_markdown "$id_html")
+	check_contains 'markdown returns a single markdown field' '{"markdown":"' "$out"
+	check_contains 'markdown converts headings' '# Heading' "$out"
+	check_contains 'markdown converts lists' '- one' "$out"
+	# Loose on cell padding: pandoc pads its columns and the built-in converter
+	# does not, and this command has to pass with either one behind it.
+	check_contains 'markdown converts tables' '| K' "$out"
+	check_contains 'markdown converts links' '[link](/rel)' "$out"
+
+	# A link clip's own URL becomes the base for the page's relative hrefs.
+	printf '{"kind":"url","text":"https://example.com/docs/page","hash":"h-html-url","url_domain":"example.com","html":"<p><a href=\\"../img/a.png\\">rel</a></p>"}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_markdown "$(run_sql "SELECT id FROM clips WHERE hash = 'h-html-url';")")
+	check_contains 'markdown resolves relative links against a url clip' \
+		'(https://example.com/img/a.png)' "$out"
+
+	out=$(cmd_markdown "$id1" 2>/dev/null) || true
+	check_contains 'markdown on a clip without html is a JSON error' '"ok":false' "$out"
+	check_contains 'markdown error names the clip' 'no HTML flavour' "$out"
+	out=$(cmd_markdown 999999 2>/dev/null) || true
+	check_contains 'markdown on a missing clip is a JSON error' '"error"' "$out"
+	out=$(cmd_markdown abc 2>/dev/null) || true
+	check_contains 'markdown with a bad id is a JSON error' '"error"' "$out"
+
+	# Re-copying the same text from a source that offers no HTML clears it.
+	run_sql "UPDATE clips SET created_at = created_at - 100000;" >/dev/null
+	printf '{"kind":"text","text":"Heading\\none\\nlink","preview":"Heading","hash":"h-html"}\n' |
+		cmd_insert >/dev/null
+	check 'a plain re-copy clears a stale html flavour' '0' \
+		"$(run_sql "SELECT CASE WHEN html IS NULL THEN 0 ELSE 1 END FROM clips WHERE hash = 'h-html';")"
+
+	# --- copy dispatches on kind ------------------------------------------
+	# wl-copy needs a Wayland session, so the selftest injects a stub and reads
+	# back exactly what the real binary would have been handed. This is the
+	# assertion that was missing while `copy` silently put an image clip's
+	# preview string on the clipboard as text.
+	local stub="$SELFTEST_ROOT/wl-copy-stub" args_file="$SELFTEST_ROOT/wl-copy.args"
+	local stdin_file="$SELFTEST_ROOT/wl-copy.stdin" keep_copy="$WL_COPY_BIN"
+	cat >"$stub" <<-STUB
+		#!/bin/sh
+		printf '%s\n' "\$*" >"$args_file"
+		cat >"$stdin_file"
+	STUB
+	chmod +x "$stub"
+	WL_COPY_BIN="$stub"
+
+	local id_copy
+	printf '{"kind":"text","text":"plain payload","hash":"h-copy-text"}\n' | cmd_insert >/dev/null
+	id_copy=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-text';")
+	out=$(cmd_copy "$id_copy")
+	check 'copy a text clip' '{"ok":true}' "$out"
+	check 'copy text uses the text/plain flavour' '--type text/plain;charset=utf-8' "$(cat "$args_file")"
+	check 'copy text sends the text, not the preview' 'plain payload' "$(cat "$stdin_file")"
+	check 'copy arms self-capture suppression' 'h-copy-text' "$(cat "$SUPPRESS_FILE")"
+
+	printf '{"kind":"url","text":"https://example.com/a","hash":"h-copy-url","url_domain":"example.com"}\n' |
+		cmd_insert >/dev/null
+	cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-url';")" >/dev/null
+	check 'copy a url clip uses the text/plain flavour' '--type text/plain;charset=utf-8' \
+		"$(cat "$args_file")"
+	check 'copy url sends the url' 'https://example.com/a' "$(cat "$stdin_file")"
+
+	printf 'PNGBYTES' >"$IMAGE_DIR/h-copy-img.png"
+	printf '{"kind":"image","preview":"Image 300x300","hash":"h-copy-img","image_path":"%s/h-copy-img.png","mime":"image/png","image_width":300,"image_height":300}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	out=$(cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-img';")")
+	check 'copy an image clip' '{"ok":true}' "$out"
+	check 'copy image uses the image mime type' '--type image/png' "$(cat "$args_file")"
+	check 'copy image sends the file bytes, not the preview' 'PNGBYTES' "$(cat "$stdin_file")"
+
+	# A stored image path is untrusted database input. Reading it by pathname
+	# followed a planted symlink and handed the target (including private keys)
+	# straight to wl-copy. The helper must refuse before a target byte is emitted.
+	local copy_victim="$SELFTEST_ROOT/private-key" copy_id
+	printf 'PRIVATE KEY MATERIAL\n' >"$copy_victim"
+	copy_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-img';")
+	rm -f -- "$IMAGE_DIR/h-copy-img.png"
+	ln -s "$copy_victim" "$IMAGE_DIR/h-copy-img.png"
+	printf 'sentinel' >"$stdin_file"
+	out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_WL_COPY="$stub" "$SELF_BIN" copy "$copy_id") 2>&1 || true)
+	check_contains 'copy refuses a symlink planted at an image asset' 'could not be read safely' "$out"
+	check 'copy emits none of the symlink target to wl-copy' 'safe' \
+		"$(grep -q 'PRIVATE KEY MATERIAL' "$stdin_file" 2>/dev/null && printf leaked || printf safe)"
+	safe_unlink "$IMAGE_DIR" h-copy-img.png
+	printf 'PNGBYTES' >"$IMAGE_DIR/h-copy-img.png"
+
+	# Even a regular file is not an image asset unless the stored path names a
+	# direct child of images/. This also rejects traversal before wl-copy starts.
+	printf '{"kind":"image","preview":"Image","hash":"h-copy-outside","image_path":"%s/../private-key","mime":"image/png"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	local outside_copy_id
+	outside_copy_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-outside';")
+	printf 'sentinel' >"$stdin_file"
+	out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_WL_COPY="$stub" "$SELF_BIN" copy "$outside_copy_id") 2>&1 || true)
+	check_contains 'copy rejects an image path with traversal' 'outside' "$out"
+	check 'a rejected outside path never invokes wl-copy' 'sentinel' "$(cat "$stdin_file")"
+
+	printf '{"kind":"files","preview":"a.txt, b.txt","hash":"h-copy-files","files":[{"path":"/tmp/a.txt","name":"a.txt"},{"path":"/tmp/b.txt","name":"b.txt"}]}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-files';")")
+	check 'copy a file list clip' '{"ok":true}' "$out"
+	check 'copy files uses the uri-list flavour' '--type text/uri-list' "$(cat "$args_file")"
+	check 'copy files sends real file:// URIs' 'file:///tmp/a.txt
+file:///tmp/b.txt' "$(cat "$stdin_file")"
+
+	out=$(cmd_copy 999999 2>/dev/null) || true
+	check_contains 'copy on a missing id is a JSON error' '"error"' "$out"
+
+	# A text/uri-list carries URIs. An unencoded space or '%' reaches the
+	# receiving app as a different path, and the watcher's decode of it hashes
+	# to something the clip it came from no longer matches.
+	printf '{"kind":"files","preview":"a b.txt","hash":"h-copy-enc","files":[{"path":"/tmp/a b.txt","name":"a b.txt"},{"path":"/tmp/100%%.txt","name":"100%%.txt"},{"path":"/tmp/caf\\u00e9.txt","name":"caf\\u00e9.txt"}]}\n' |
+		cmd_insert >/dev/null
+	cmd_copy "$(run_sql "SELECT id FROM clips WHERE hash = 'h-copy-enc';")" >/dev/null
+	check 'copy percent-encodes spaces, percents and UTF-8 in file URIs' \
+		'file:///tmp/a%20b.txt
+file:///tmp/100%25.txt
+file:///tmp/caf%C3%A9.txt' "$(cat "$stdin_file")"
+
+	# The fallback hash used to contain a newline, which truncated the token
+	# `copy` writes for self-capture suppression -- the clip came straight back
+	# in as a brand new one.
+	local id_nl hash_probe="$SELFTEST_ROOT/hash.probe"
+	printf '{"kind":"text","preview":"two lines","text":"line one\\nline two"}\n' |
+		cmd_insert >/dev/null
+	id_nl=$(run_sql "SELECT id FROM clips WHERE preview = 'two lines';")
+	check 'a generated hash never contains a newline' '0' \
+		"$(run_sql "SELECT instr(hash, char(10)) FROM clips WHERE id = $id_nl;")"
+	cmd_copy "$id_nl" >/dev/null
+	sql_quote "$hash_probe"
+	run_sql "SELECT writefile($REPLY_QUOTED, hash) FROM clips WHERE id = $id_nl;" >/dev/null
+	check 'the suppression token is the clip hash in full' \
+		"$(cat "$hash_probe")" "$(cat "$SUPPRESS_FILE")"
+
+	run_sql "DELETE FROM clips WHERE hash LIKE 'h-copy-%' OR hash LIKE 'h-html%';" >/dev/null
+	rm -f -- "$IMAGE_DIR/h-copy-img.png"
+	WL_COPY_BIN="$keep_copy"
+
+	# --- asset cleanup ----------------------------------------------------
+	# Orphans only: the still-referenced set is now computed in one statement
+	# rather than one sqlite3 per asset, and the answer has to stay the same.
+	local shared="$IMAGE_DIR/shared.png"
+	: >"$shared"
+	printf '{"kind":"image","preview":"Image","hash":"h-share-a","image_path":"%s"}\n' "$shared" |
+		cmd_insert >/dev/null
+	printf '{"kind":"image","preview":"Image","hash":"h-share-b","image_path":"%s"}\n' "$shared" |
+		cmd_insert >/dev/null
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-share-a';")" >/dev/null
+	check 'an asset another clip still references survives the delete' 'present' \
+		"$([ -e "$shared" ] && printf present || printf gone)"
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-share-b';")" >/dev/null
+	check 'the last reference gone, the asset is unlinked' 'gone' \
+		"$([ -e "$shared" ] && printf present || printf gone)"
+
+	# A path may contain a newline; the line-delimited doomed list never
+	# unlinked one, so the file stayed on disk forever.
+	local nl_asset="$IMAGE_DIR/two"$'\n'"lines.png"
+	: >"$nl_asset"
+	printf '{"kind":"image","preview":"Image","hash":"h-nl-asset","image_path":"%s/two\\nlines.png"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	cmd_delete "$(run_sql "SELECT id FROM clips WHERE hash = 'h-nl-asset';")" >/dev/null
+	check 'delete unlinks an asset whose path contains a newline' 'gone' \
+		"$([ -e "$nl_asset" ] && printf present || printf gone)"
+
+	# Prefix globs match images/../precious even though it resolves outside the
+	# asset directory. A public insert followed by delete must never unlink it.
+	local traversal_victim="$STATE_DIR/precious-gc.txt" traversal_id
+	printf 'PRECIOUS\n' >"$traversal_victim"
+	printf '{"kind":"image","preview":"Image","hash":"h-gc-traversal","image_path":"%s/../precious-gc.txt"}\n' \
+		"$IMAGE_DIR" | cmd_insert >/dev/null
+	traversal_id=$(run_sql "SELECT id FROM clips WHERE hash = 'h-gc-traversal';")
+	cmd_delete "$traversal_id" >/dev/null
+	check 'asset cleanup rejects a traversal path from a public insert' 'PRECIOUS' \
+		"$(cat "$traversal_victim")"
+	check 'the traversal row itself is still deleted' '0' \
+		"$(run_sql "SELECT count(*) FROM clips WHERE hash = 'h-gc-traversal';")"
+
+	# --- fts5 query syntax ------------------------------------------------
+	# fts5 reads a bare AND/OR/NOT as an operator: an unquoted token turned
+	# these into a syntax error, which dropped to the LIKE path -- where the
+	# already-tokenised term matched nothing at all.
+	printf '{"kind":"text","preview":"NOT NULL","text":"alter table t add column x NOT NULL","hash":"h-fts-not"}\n' |
+		cmd_insert >/dev/null
+	printf '{"kind":"text","preview":"a AND b","text":"alpha AND beta together","hash":"h-fts-and"}\n' |
+		cmd_insert >/dev/null
+	out=$(cmd_list --limit 50 --query 'NOT NULL')
+	check_contains 'a query containing NOT finds its clip' '"hash":"h-fts-not"' "$out"
+	out=$(cmd_list --limit 50 --query 'alpha AND beta')
+	check_contains 'a query containing AND finds its clip' '"hash":"h-fts-and"' "$out"
+	out=$(cmd_count --query 'NOT')
+	check_contains 'count honours a query that is one fts5 operator' '"filtered":1' "$out"
+
+	# --- invalid UTF-8 ----------------------------------------------------
+	# Invalid bytes used to reach the database and then the JSON, where QML's
+	# JSON.parse rejects the whole page rather than the one bad clip.
+	local dirty utf8_expected='café  tail'
+	command -v iconv >/dev/null 2>&1 || utf8_expected='caf  tail'
+	mktempfile
+	dirty="$REPLY_TMPFILE"
+	printf '{"kind":"text","hash":"h-utf8","preview":"utf8","text":"caf\xc3\xa9 \xff tail"}\n' >"$dirty"
+	cmd_insert <"$dirty" >/dev/null
+	check 'insert drops invalid UTF-8 and keeps the valid bytes' "$utf8_expected" \
+		"$(run_sql "SELECT text FROM clips WHERE hash = 'h-utf8';")"
+	out=$(cmd_list --limit 50 --query 'tail')
+	check 'the listing that carries it is valid UTF-8' 'valid' \
+		"$(printf '%s' "$out" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && printf valid || printf invalid)"
+
+	# --- numeric arguments ------------------------------------------------
+	# --limit reaches bash arithmetic, where an over-long number is a shell
+	# error on stderr instead of the JSON document the caller is parsing.
+	out=$(cmd_list --limit 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --limit is a JSON error' '"error"' "$out"
+	out=$(cmd_prune --max 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --max is a JSON error' '"error"' "$out"
+	out=$(cmd_list --offset 99999999999999999999 2>/dev/null) || true
+	check_contains 'an out-of-range --offset is a JSON error' '"error"' "$out"
+
+	# --- descriptor-safe cache markers -------------------------------------
+	if [ "$FTS_ENABLED" = "1" ]; then
+		local keep_fts_flag="$FTS_ENABLED" stamp_victim="$SELFTEST_ROOT/stamp-victim"
+		printf 'STAMP VICTIM\n' >"$stamp_victim"
+
+		# The old content-bearing .fts name is removed during the first re-probe.
+		# If an attacker planted a symlink there, unlinkat removes only the link.
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		ln -s "$stamp_victim" "$STATE_DIR/.fts"
+		FTS_ENABLED=0
+		ensure_schema
+		check 'a missing FTS marker is re-probed after a sqlite3 upgrade' '1' "$FTS_ENABLED"
+		check 'the legacy .fts symlink is removed without touching its target' 'STAMP VICTIM' \
+			"$(cat "$stamp_victim")"
+		check 'and the legacy symlink itself is gone' 'gone' \
+			"$([ -e "$STATE_DIR/.fts" ] || [ -L "$STATE_DIR/.fts" ] && printf present || printf gone)"
+
+		# A planted new marker must be refused when the rare re-probe writes it.
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		ln -s "$stamp_victim" "$STATE_DIR/$FTS_ENABLED_STAMP"
+		out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+			CLIPBASKET_SQLITE="$SQLITE_BIN" "$SELF_BIN" count) 2>&1 || true)
+		check_contains 'a symlink planted at the FTS marker is refused' 'symlink' "$out"
+		check 'and the FTS marker target is untouched' 'STAMP VICTIM' "$(cat "$stamp_victim")"
+		safe_unlink "$STATE_DIR" "$FTS_ENABLED_STAMP"
+		probe_fts
+
+		# The per-schema marker is written through the same helper.
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
+		ln -s "$stamp_victim" "$STATE_DIR/.schema-v$SCHEMA_VERSION"
+		out=$( (CLIPBASKET_STATE_DIR="$STATE_DIR" CLIPBASKET_DB="$DB_PATH" \
+			CLIPBASKET_SQLITE="$SQLITE_BIN" "$SELF_BIN" count) 2>&1 || true)
+		check_contains 'a symlink planted at the schema marker is refused' 'symlink' "$out"
+		check 'and the schema marker target is untouched' 'STAMP VICTIM' "$(cat "$stamp_victim")"
+		safe_unlink "$STATE_DIR" ".schema-v$SCHEMA_VERSION"
+		write_stamp_marker ".schema-v$SCHEMA_VERSION"
+		FTS_ENABLED="$keep_fts_flag"
+	fi
+
+	# --- signals ----------------------------------------------------------
+	# EXIT alone is not enough: a signal with no handler kills bash outright
+	# and the EXIT trap never runs, so an interrupted run used to leave the
+	# clipboard payload sitting in $TMPDIR for anyone to read.
+	local sigdir="$SELFTEST_ROOT/signal" sigpid tries=0
+	mkdir -p "$sigdir"
+	mkfifo "$sigdir/fifo"
+	# Opened read-write so neither end of the fifo blocks on open.
+	exec 8<>"$sigdir/fifo"
+	# 8>&- so the child does not inherit the parent's write end and hold the
+	# fifo open against itself.
+	TMPDIR="$sigdir" CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+		"$SCRIPT_DIR/clipbasket-db" insert <"$sigdir/fifo" 8>&- >/dev/null 2>&1 &
+	sigpid=$!
+	while [ "$tries" -lt 400 ]; do
+		set -- "$sigdir"/clipbasket.*
+		[ -f "$1" ] && break
+		tries=$((tries + 1))
+		sleep 0.01
+	done
+	kill -TERM "$sigpid" 2>/dev/null || true
+	exec 8>&-
+	tries=0
+	while kill -0 "$sigpid" 2>/dev/null && [ "$tries" -lt 400 ]; do
+		tries=$((tries + 1))
+		sleep 0.01
+	done
+	kill -KILL "$sigpid" 2>/dev/null || true
+	wait "$sigpid" 2>/dev/null || true
+	set -- "$sigdir"/clipbasket.*
+	check 'a signalled run leaves no clipboard payload behind' 'clean' \
+		"$([ -f "$1" ] && printf 'left behind: %s' "$1" || printf clean)"
+
+	# And the other half of the same bug: mktempfile registered its file inside
+	# a command substitution, so the array cleanup reads was always empty and
+	# even an ordinary run left the payload in $TMPDIR.
+	rm -f -- "$sigdir"/clipbasket.*
+	printf '{"kind":"text","text":"leak check","hash":"h-leak"}\n' |
+		TMPDIR="$sigdir" CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+			"$SCRIPT_DIR/clipbasket-db" insert >/dev/null 2>&1 || true
+	set -- "$sigdir"/clipbasket.*
+	check 'a normal run leaves no clipboard payload behind' 'clean' \
+		"$([ -f "$1" ] && printf 'left behind: %s' "$1" || printf clean)"
+
+	run_sql "DELETE FROM clips WHERE hash <> 'h-touch';" >/dev/null
+
+	# --- performance ------------------------------------------------------
+	printf '\nPopulating 10000 clips to check latency...\n'
+	run_sql "BEGIN;
+	  WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 10000)
+	  INSERT INTO clips (kind, preview, text, hash, created_at, searchable)
+	  SELECT 'text', 'bulk ' || i, 'bulk clip ' || i || ' lorem ipsum dolor',
+	         'bulk-' || i, 1700000000 + i, 'bulk clip ' || i || ' lorem ipsum dolor'
+	  FROM seq;
+	  COMMIT;" >/dev/null
+
+	time_ms() {
+		# $1 label, then the command
+		local label="$1"
+		shift
+		t0=$(date +%s%N 2>/dev/null || printf 0)
+		"$@" >/dev/null
+		t1=$(date +%s%N 2>/dev/null || printf 0)
+		if [ "${#t0}" -ge 16 ] && [ "${#t1}" -ge 16 ]; then
+			printf '      %-28s %s ms\n' "$label" $(((t1 - t0) / 1000000))
+		fi
+	}
+
+	# --- predictable-path hardening (marketplace security review) ------------
+	symroot="$SELFTEST_ROOT/symattack"; mkdir -p "$symroot/real"
+	ln -s "$symroot/real" "$symroot/planted"
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/planted" CLIPBASKET_DB="$symroot/planted/clips.db" "$SELF_BIN" count) 2>&1 || true)
+	check_contains 'a symlinked state dir is refused' 'symlink' "$out"
+	ln -sf "$SELFTEST_ROOT/elsewhere.db" "$symroot/real/clips.db"
+	out=$( (CLIPBASKET_STATE_DIR="$symroot/real" CLIPBASKET_DB="$symroot/real/clips.db" "$SELF_BIN" count) 2>&1 || true)
+	check_contains 'a symlinked database file is refused' 'symlink' "$out"
+	rm -f "$SUPPRESS_FILE"; ln -s "$SELFTEST_ROOT/steal-token" "$SUPPRESS_FILE"
+	# A child process, not cmd_suppress in-process: die exits, and it must exit
+	# the CLI under test, not this suite.
+	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" "$SELF_BIN" suppress deadbeef) 2>&1 || true)
+	check_contains 'a symlinked suppression file is refused' 'symlink' "$out"
+	check 'and the token was not written through it' 'absent' "$( [ -e "$SELFTEST_ROOT/steal-token" ] && echo present || echo absent )"
+	rm -f "$SUPPRESS_FILE"
+
+	# The refusal above could in principle come from the fast-fail pathname
+	# check rather than from the descriptor-bound write, and those are not the
+	# same guarantee. Point CLIPBASKET_SAFEFILE at nothing: if the token write
+	# still succeeds, it is not going through the helper.
+	out=$( (CLIPBASKET_STATE_DIR="$SELFTEST_ROOT" CLIPBASKET_DB="$DB_PATH" \
+		CLIPBASKET_SAFEFILE="$SELFTEST_ROOT/no-such-helper" "$SELF_BIN" suppress cafebabe) 2>&1 || true)
+	check_contains 'the suppression token is written by clipbasket-safefile' \
+		'clipbasket-safefile' "$out"
+	check 'and no token is left behind when the helper is missing' 'absent' \
+		"$( [ -e "$SUPPRESS_FILE" ] && echo present || echo absent )"
+	rm -f "$SUPPRESS_FILE"
+
+	out=$(cmd_list --limit 50 --query 'lorem')
+	check_contains 'search over 10k clips returns hits' '"kind":"text"' "$out"
+	out=$(cmd_count --query 'lorem')
+	check_contains 'count over 10k clips is filtered' '"total":10001' "$out"
+	time_ms 'list (no query)' cmd_list --limit 50
+	time_ms 'list (search)' cmd_list --limit 50 --query lorem
+	time_ms 'list (deep offset)' cmd_list --limit 50 --offset 9000
+	time_ms 'count (search)' cmd_count --query lorem
+
+	printf '\n%s passed, %s failed\n' "$pass" "$fail"
+	[ "$fail" -eq 0 ] || return 1
+	return 0
+}
+
+usage() {
+	cat >&2 <<-'TXT'
+		clipbasket-db <subcommand>
+
+		  list   --limit N [--offset N] [--filter all|text|url|image|files|saved] [--query STR]
+		  get    <id>
+		  insert                     (JSON clip on stdin)
+		  pin    <id> --on|--off
+		  save   <id> --on|--off
+		  delete <id>
+		  clear  [--all]
+		  count  [--filter F] [--query STR]
+		  prune  --max N
+		  markdown <id> [--base-url URL]
+		                             (HTML flavour -> GitHub-Flavored Markdown)
+		  copy   <id>                (extension: re-copy via wl-copy)
+		  touch  <id>                (extension: bump to top)
+		  suppress <hash>            (extension: arm self-capture suppression)
+		  info
+		  selftest
+	TXT
+	exit 2
+}
+
+main() {
+	local subcommand="${1:-}"
+	[ $# -gt 0 ] && shift || true
+
+	case "$subcommand" in
+	selftest)
+		cmd_selftest "$@"
+		return
+		;;
+	'' | -h | --help | help) usage ;;
+	esac
+
+	ensure_schema
+
+	case "$subcommand" in
+	list) cmd_list "$@" ;;
+	get) cmd_get "$@" ;;
+	insert) cmd_insert "$@" ;;
+	pin) cmd_flag pinned "$@" ;;
+	save) cmd_flag saved "$@" ;;
+	delete) cmd_delete "$@" ;;
+	clear) cmd_clear "$@" ;;
+	count) cmd_count "$@" ;;
+	prune) cmd_prune "$@" ;;
+	markdown) cmd_markdown "$@" ;;
+	copy) cmd_copy "$@" ;;
+	touch) cmd_touch "$@" ;;
+	suppress) cmd_suppress "$@" ;;
+	info) cmd_info "$@" ;;
+	*) die "unknown subcommand: $subcommand" ;;
+	esac
+}
+
+main "$@"

@@ -67,3 +67,10 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added Omarchy Sensei keyboard coaching widget and practice tracker.
 - Real-time mouse habit interception, automatic Super+K shortcut task generation, and lifetime leveling.
 - Integrated into right bar layout with task badge counter.
+
+## clipbasket.clipboard
+
+- Added Clipbasket clipboard history manager with SQLite backend.
+- Filter by Text, Links, Images, Files, and Saved/Pinned clips.
+- Support for HTML-to-Markdown conversion, image dimensions lightbox, and password manager privacy filtering.
+- Integrated into right bar layout.

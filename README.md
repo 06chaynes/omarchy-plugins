@@ -18,6 +18,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Notification Center** | [`jankeesvw.notification-center`](plugins/jankeesvw.notification-center) | Persistent notification history archive, DND controls, and notification drawer. | [jankeesvw/omarchy-notification-center](https://github.com/jankeesvw/omarchy-notification-center.git) |
 | **Omarchy X-Ray** | [`io.github.randazraik.xray`](plugins/io.github.randazraik.xray) | Live process inspector and system trace overlay for windows, services, containers, ports, and devices. | [RandaZraik/omarchy-xray](https://github.com/RandaZraik/omarchy-xray.git) |
 | **Omarchy Sensei** | [`io.github.nilszeilon.omarchy-sensei`](plugins/io.github.nilszeilon.omarchy-sensei) | Keyboard-first coach that turns mouse habits into shortcut practice tasks. | [nilszeilon/omarchy-sensei](https://github.com/nilszeilon/omarchy-sensei.git) |
+| **Clipbasket** | [`clipbasket.clipboard`](plugins/clipbasket.clipboard) | Searchable clipboard history manager with category filters, image lightbox, and Markdown export. | [clipbasket/clipbasket-omarchy](https://github.com/clipbasket/clipbasket-omarchy.git) |
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 
 ## Installation
