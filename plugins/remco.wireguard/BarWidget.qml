@@ -322,11 +322,12 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.statusText
-    slotSize: Style.bar.statusSlot
-    fontSize: Style.font.caption
+    fontSize: Style.space(16)
+    text: root.statusText || "󰌾"
     tooltipText: root.statusTooltip
-    active: root.vpnActive
+    active: root.vpnActive || root.popupOpen
+    useActiveColor: true
+    activeColor: Color.accent
     onPressed: root.togglePopup()
   }
 
