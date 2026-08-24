@@ -903,7 +903,7 @@ Panel {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 text: root.settingsService
-                  ? root.settingsService.name.toUpperCase() + (root.settingsService.type === "aws" ? " · REGIONS" : " · COMPONENTS")
+                  ? root.settingsService.name.toUpperCase() + (root.settingsService.type === "aws" || root.settingsService.type === "azure" ? " · REGIONS" : " · COMPONENTS")
                   : ""
                 textFormat: Text.PlainText
                 color: Qt.darker(root.fg, 1.2)

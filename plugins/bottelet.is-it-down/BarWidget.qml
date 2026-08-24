@@ -72,17 +72,15 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: ""
-    slotSize: Style.bar.statusSlot
-    active: root.issueCount > 0
-    useActiveColor: true
-    activeColor: root.badgeColor
-    // Tooltip suppressed because the panel is the detail view.
-    tooltipText: ""
+    fontSize: Style.space(18)
+    text: root.issueCount > 0 ? "󰀦" : ""
+    tooltipText: root.issueCount > 0
+      ? "Is It Down? · " + root.issueCount + " issue" + (root.issueCount === 1 ? "" : "s")
+      : "Is It Down? · All operational"
 
     onPressed: function(b) {
       if (b === Qt.MiddleButton) root.refresh()
-      else root.togglePanel()
+      else if (b === Qt.LeftButton) root.togglePanel()
     }
   }
 

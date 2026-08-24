@@ -22,6 +22,8 @@ function registry() {
       api: "https://www.githubstatus.com/api/v2/summary.json", page: "https://www.githubstatus.com" },
     { key: "aws", name: "AWS", type: "aws", defaultEnabled: true,
       api: "https://health.aws.amazon.com/public/currentevents", page: "https://health.aws.amazon.com/health/status" },
+    { key: "azure", name: "Azure", type: "azure", defaultEnabled: true,
+      api: "https://azure.status.microsoft/en-us/status/feed/", page: "https://azure.status.microsoft/en-us/status" },
     { key: "cloudflare", name: "Cloudflare", type: "statuspage", defaultEnabled: true,
       api: "https://www.cloudflarestatus.com/api/v2/summary.json", page: "https://www.cloudflarestatus.com" },
     { key: "npm", name: "npm", type: "statuspage", defaultEnabled: true,
@@ -277,8 +279,52 @@ function awsRegions() {
   ]
 }
 
+function azureRegions() {
+  return [
+    { code: "eastus", name: "East US" },
+    { code: "eastus2", name: "East US 2" },
+    { code: "southcentralus", name: "South Central US" },
+    { code: "westus2", name: "West US 2" },
+    { code: "westus3", name: "West US 3" },
+    { code: "centralus", name: "Central US" },
+    { code: "northcentralus", name: "North Central US" },
+    { code: "westus", name: "West US" },
+    { code: "canadacentral", name: "Canada Central" },
+    { code: "canadaeast", name: "Canada East" },
+    { code: "brazilsouth", name: "Brazil South" },
+    { code: "northeurope", name: "North Europe (Ireland)" },
+    { code: "westeurope", name: "West Europe (Netherlands)" },
+    { code: "uksouth", name: "UK South (London)" },
+    { code: "ukwest", name: "UK West (Cardiff)" },
+    { code: "francecentral", name: "France Central (Paris)" },
+    { code: "germanywestcentral", name: "Germany West Central (Frankfurt)" },
+    { code: "switzerlandnorth", name: "Switzerland North (Zurich)" },
+    { code: "norwayeast", name: "Norway East (Oslo)" },
+    { code: "swedencentral", name: "Sweden Central" },
+    { code: "polandcentral", name: "Poland Central" },
+    { code: "italynorth", name: "Italy North (Milan)" },
+    { code: "spaincentral", name: "Spain Central (Madrid)" },
+    { code: "eastasia", name: "East Asia (Hong Kong)" },
+    { code: "southeastasia", name: "Southeast Asia (Singapore)" },
+    { code: "australiaeast", name: "Australia East (Sydney)" },
+    { code: "australiasoutheast", name: "Australia Southeast (Melbourne)" },
+    { code: "centralindia", name: "Central India (Pune)" },
+    { code: "southindia", name: "South India (Chennai)" },
+    { code: "westindia", name: "West India (Mumbai)" },
+    { code: "japaneast", name: "Japan East (Tokyo)" },
+    { code: "japanwest", name: "Japan West (Osaka)" },
+    { code: "koreacentral", name: "Korea Central (Seoul)" },
+    { code: "koreasouth", name: "Korea South (Busan)" },
+    { code: "uaenorth", name: "UAE North (Dubai)" },
+    { code: "southafricanorth", name: "South Africa North (Johannesburg)" },
+    { code: "israelcentral", name: "Israel Central" },
+    { code: "qatarcentral", name: "Qatar Central" },
+    { code: "global", name: "Global / non-regional" }
+  ]
+}
+
 // Rows for a service's settings drill-down page: everything that can be
-// toggled on/off, with its current state. AWS pages list the static region
+// toggled on/off, with its current state. AWS and Azure pages list the static region
 // catalog; statuspage pages list the components seen in the last fetch.
 // Ignored entries that match nothing current are kept as extra rows so they
 // can always be re-enabled.
@@ -310,6 +356,20 @@ function settingsCatalog(service, result, ignoreList, awsLiveRegionCodes) {
       if (known[live[a]]) continue
       known[live[a]] = true
       rows.push({ label: live[a], desc: "", muteKeys: [live[a]], enabled: !has(live[a]) })
+    }
+  } else if (service && service.type === "azure") {
+    var azRegions = azureRegions()
+    for (var az = 0; az < azRegions.length; az++) {
+      var azR = azRegions[az]
+      var azNameKey = azR.name.toLowerCase()
+      known[azR.code] = true
+      known[azNameKey] = true
+      rows.push({
+        label: azR.code,
+        desc: azR.name,
+        muteKeys: [azR.code, azNameKey],
+        enabled: !(has(azR.code) || has(azNameKey))
+      })
     }
   } else {
     var catalog = result && result.catalog ? result.catalog : []
@@ -406,14 +466,81 @@ function parseAws(raw, ignoreRegions) {
   return { severity: overall, headline: headline, detail: "", items: items, error: false }
 }
 
+function parseAzure(raw, ignoreList) {
+  var text = String(raw || "").trim()
+  if (!text || (text.indexOf("<rss") === -1 && text.indexOf("<channel") === -1)) {
+    return unreachableResult()
+  }
+
+  var items = []
+  var overall = SEV_OK
+  var ignore = normalizeList(ignoreList)
+
+  var itemRegex = /<item[\s\S]*?<\/item>/gi
+  var match
+  while ((match = itemRegex.exec(text)) !== null) {
+    var itemXml = match[0]
+    var titleMatch = itemXml.match(/<title(?:\s+[^>]*)?>([\s\S]*?)<\/title>/i)
+    var title = titleMatch ? titleMatch[1].replace(/<!\[CDATA\[(.*?)\]\]>/gi, "$1").trim() : ""
+    var descMatch = itemXml.match(/<description(?:\s+[^>]*)?>([\s\S]*?)<\/description>/i)
+    var desc = descMatch ? descMatch[1].replace(/<!\[CDATA\[(.*?)\]\]>/gi, "$1").replace(/<[^>]+>/g, "").trim() : ""
+
+    if (!title && !desc) continue
+
+    var titleLower = title.toLowerCase()
+    var descLower = desc.toLowerCase()
+
+    var isIgnored = false
+    for (var k = 0; k < ignore.length; k++) {
+      if (titleLower.indexOf(ignore[k]) !== -1 || descLower.indexOf(ignore[k]) !== -1) {
+        isIgnored = true
+        break
+      }
+    }
+    if (isIgnored) continue
+
+    var sev = SEV_MINOR
+    if (titleLower.indexOf("outage") !== -1 || titleLower.indexOf("critical") !== -1 ||
+        titleLower.indexOf("major") !== -1 || descLower.indexOf("major outage") !== -1) {
+      sev = SEV_MAJOR
+    } else if (titleLower.indexOf("resolved") !== -1 || descLower.indexOf("resolved") !== -1) {
+      sev = SEV_OK
+    }
+
+    if (sev > overall) overall = sev
+
+    items.push({
+      name: title || "Azure Event",
+      muteKey: (title || "").toLowerCase(),
+      status: desc || (sev === SEV_MAJOR ? "Major Outage" : (sev === SEV_MINOR ? "Degradation" : "Operational")),
+      severity: sev
+    })
+  }
+
+  var headline = items.length === 0
+    ? "All systems operational"
+    : items.length + (items.length === 1 ? " active event" : " active events")
+
+  return {
+    severity: overall,
+    headline: headline,
+    detail: items.length > 0 ? items[0].name : "",
+    items: items,
+    catalog: [],
+    hiddenOk: 0,
+    hiddenIssues: 0,
+    error: false
+  }
+}
+
 function parseResult(service, raw, options) {
   var text = String(raw || "").trim()
   if (text === "") return unreachableResult()
   var ignore = options ? options.ignore : null
   try {
-    return service.type === "aws"
-      ? parseAws(text, ignore)
-      : parseStatuspage(text, ignore)
+    if (service.type === "aws") return parseAws(text, ignore)
+    if (service.type === "azure") return parseAzure(text, ignore)
+    return parseStatuspage(text, ignore)
   } catch (e) {
     return unreachableResult()
   }
@@ -464,11 +591,13 @@ if (typeof module !== "undefined") {
     humanizeStatus: humanizeStatus,
     parseStatuspage: parseStatuspage,
     parseAws: parseAws,
+    parseAzure: parseAzure,
     awsEventRegion: awsEventRegion,
     awsRegionIgnored: awsRegionIgnored,
     normalizeList: normalizeList,
     ignoreListFor: ignoreListFor,
     awsRegions: awsRegions,
+    azureRegions: azureRegions,
     settingsCatalog: settingsCatalog,
     filterCatalog: filterCatalog,
     parseResult: parseResult,
