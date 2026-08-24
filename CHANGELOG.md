@@ -93,3 +93,9 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Fixed missing `qs.Ui` import in `PlainTextDropdown.qml` to resolve `BorderSurface` type error.
 - Updated `BarWidget.qml` to use `BarIconButton` with 22px icon scaling.
 - Integrated into center bar layout.
+
+## melonamin.apple-music
+
+- Added Apple Music dropdown, compact queue, live audio spectrum, and mini-player plugin.
+- Added full-screen layer-shell click backdrop in `BarWidget.qml` to prevent accidental hover focus loss under `follow_mouse = 1` while ensuring clean click-away dismissal.
+- Integrated into center bar layout.

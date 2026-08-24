@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "melonamin.apple-music",
+  "name": "Apple Music",
+  "version": "0.2.0",
+  "author": "melonamin",
+  "description": "A theme-aware Apple Music dropdown with compact queue controls, a live Omarchy spectrum, and a persistent mini-player.",
+  "homepage": "https://github.com/melonamin/omarchy-apple-music",
+  "license": "MIT",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Apple Music",
+    "description": "Open Apple Music, control playback, and see what is playing",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
