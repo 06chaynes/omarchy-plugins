@@ -1,8 +1,9 @@
 import QtQuick
 import Quickshell.Io
 
-QtObject {
+Item {
     id: root
+    visible: false
 
     readonly property string backendPath: decodeURIComponent(Qt.resolvedUrl("../backend/main.py").toString().replace(/^file:\/\//, ""))
     property int serial: 0
@@ -120,7 +121,8 @@ QtObject {
         if (queued.length > 0) start();
     }
 
-    property Process backend: Process {
+    Process {
+        id: backend
         command: ["python3", root.backendPath]
         stdinEnabled: true
         stdout: SplitParser {
@@ -155,8 +157,8 @@ QtObject {
         }
     }
 
-
-    property Timer requestWatchdog: Timer {
+    Timer {
+        id: requestWatchdog
         interval: 250
         repeat: true
         running: false
