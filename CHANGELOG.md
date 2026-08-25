@@ -132,4 +132,14 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Distraction-free session management: Do Not Disturb, stay-awake idle inhibition, night light deactivation, and performance power profile switching.
 - Steam Deck UI in Gamescope / Steam Big Picture session launcher.
 - Quick launcher detection for installed game clients (Steam, Heroic, Lutris, Bottles, Prism Launcher, RetroArch).
+- Integrated into center bar layout.
+
+## jltrench.textify
+
+- Added Textify private local screen OCR widget and native Rust engine.
+- Instant region screen selection (`slurp` + `grim`) and fullscreen capture.
+- Image pre-processing via ImageMagick and OCR extraction via Tesseract.
+- Direct-to-clipboard (`wl-copy`) auto-copy pipeline with zero cloud/network telemetry.
+- 12-item historical extraction drawer with confidence scores and 1-click re-copying.
+- Auto keyboard layout / language detection from Hyprland with manual multi-language picker.
 - Integrated into right bar layout.

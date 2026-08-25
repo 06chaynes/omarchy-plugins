@@ -27,6 +27,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
 | **Omarchy Synchro** | [`harel.omarchy-synchro`](plugins/harel.omarchy-synchro) | Safe Git configuration repository manager with 1-click sync, categorized previews, and rollbacks. | [harel/omarchy-synchro](https://github.com/harel/omarchy-synchro.git) |
 | **Game Mode Switcher** | [`silvaio.gamemode`](plugins/silvaio.gamemode) | One-click Game Mode for Hyprland performance tuning, DND, stay-awake, and Steam Gamescope Deck UI. | [silvaio/gamemode-switcher](https://github.com/silvaio/gamemode-switcher.git) |
+| **Textify** | [`jltrench.textify`](plugins/jltrench.textify) | Private, local screen OCR powered by Tesseract and a native Rust engine. Extract text to clipboard instantly. | [jltrench/textify](https://github.com/jltrench/textify.git) |
 
 ## Installation
 
