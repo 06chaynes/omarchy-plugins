@@ -124,3 +124,12 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added comprehensive pretty-printing formatter across all status previews, seed diagnostic stages, and remote actions.
 - Updated top-bar widget with live dynamic sync state icons and status badges.
 - Integrated into right bar layout.
+
+## silvaio.gamemode
+
+- Added Game Mode Switcher widget and control panel.
+- Dynamic Hyprland optimizations: disable animations, blur, drop shadows, and window gaps while gaming with complete automatic restoration on exit.
+- Distraction-free session management: Do Not Disturb, stay-awake idle inhibition, night light deactivation, and performance power profile switching.
+- Steam Deck UI in Gamescope / Steam Big Picture session launcher.
+- Quick launcher detection for installed game clients (Steam, Heroic, Lutris, Bottles, Prism Launcher, RetroArch).
+- Integrated into right bar layout.
