@@ -143,3 +143,32 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - 12-item historical extraction drawer with confidence scores and 1-click re-copying.
 - Auto keyboard layout / language detection from Hyprland with manual multi-language picker.
 - Integrated into right bar layout.
+
+## jobo.lantern
+
+- Added Lantern retro monochrome CRT interactive fiction terminal emulator.
+- Bundled complete official Zork Trilogy: *Zork I: The Great Underground Empire*, *Zork II: The Wizard of Frobozz*, and *Zork III: The Dungeon Master*.
+- Standalone self-contained `dfrotz` Z-machine runtime (x86_64 glibc Linux) with zero external package dependencies.
+- Hardware-modeled CRT fragment shader with scanlines, bloom, refresh bands, and power flutter.
+- Interactive CRT controls: RGB phosphor selector (Amber, Green, Dynamic Omarchy Theme), SCALE selector (1×, 1.25×, 1.5×), and analog BRIGHT dial.
+- Built-in Memory Bank save/load system (`Ctrl+S`/`Ctrl+L`) with timestamping and safe overwrite confirmation.
+- Persistent Hyprland window positioning with floating geometry restore.
+- Top bar widget with active story phosphor pulsing indicator.
+- Integrated into center bar layout after Retro Library.
+
+## io.github.06chaynes.drawers
+
+- Added Drawers, a bar widget that groups other bar widgets into a single expandable pill (`allowMultiple: true`).
+- Dropdown hosts the tucked widgets live from `BarWidgetRegistry` — real instances, with their status indicators, timers, and their own panels intact.
+- Row or grid dropdown layouts, sized from measured content and clamped to the screen, with outside-click dismissal through the shell's `HyprlandFocusGrab` and bar popout coordinator.
+- Per-drawer identity: icon glyph, optional text label, custom tooltip, and an expand chevron. Icons are chosen from a searchable palette of glyphs verified to render in the bar font, or typed in directly.
+- Per-slot tooltips inside the dropdown, preferring each widget's live tooltip text over its catalogue name.
+- Satellite alert slide-out: a tucked widget signalling attention slides out beside the pill, then folds back after `alertDuration`.
+- Auto-Drawer wizard reads the current bar, groups the loose widgets by plugin category, and presents an editable proposal before adopting. It only adds drawers — hand-curated ones are never touched — and never proposes the widget named by `bar.centerAnchor`.
+- Global manager window (`panel` entry point, `keepLoaded: true`) reachable with no drawer on the bar: lists every drawer, adds and removes them, and edits the selected one against a searchable catalogue of every installed bar widget. Every change is staged — including moving a widget from one drawer to another — and Save Changes reconciles the whole set in one atomic write.
+- Omarchy menu integration via `install-menu`, writing a delimited, reversible block into `~/.config/omarchy/extensions/omarchy-menu.jsonc` for **Setup → Drawers → Manage Drawers / Auto-arrange**.
+- IPC on two targets: `io.github.06chaynes.drawers` (`manage`, `edit`, `autoArrange`, `installMenu`, `uninstallMenu`, `status`, `close`) on the always-loaded panel, and `io.github.06chaynes.drawers.bar` (`open`, `close`, `toggle`, `status`) on the bar pills.
+- Tucking moves a widget's whole layout entry, preserving its inline settings. Untucking returns it to the bar with those settings — and with anything it saved while tucked — anchored to the neighbour it sat behind; a widget with no recorded origin goes to its manifest's `defaultSection`.
+- Drawers carry an opaque `drawerId`, so several stay individually addressable even when they share a label.
+- `drawer-config.py` backend owns every `shell.json` read and write: bar-widget discovery by manifest scan, atomic writes resolved past symlinks, and `plugins[]` reconciliation that keeps tucked widgets loaded.
+- Integrated into center bar layout.

@@ -28,6 +28,8 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Omarchy Synchro** | [`harel.omarchy-synchro`](plugins/harel.omarchy-synchro) | Safe Git configuration repository manager with 1-click sync, categorized previews, and rollbacks. | [harel/omarchy-synchro](https://github.com/harel/omarchy-synchro.git) |
 | **Game Mode Switcher** | [`silvaio.gamemode`](plugins/silvaio.gamemode) | One-click Game Mode for Hyprland performance tuning, DND, stay-awake, and Steam Gamescope Deck UI. | [silvaio/gamemode-switcher](https://github.com/silvaio/gamemode-switcher.git) |
 | **Textify** | [`jltrench.textify`](plugins/jltrench.textify) | Private, local screen OCR powered by Tesseract and a native Rust engine. Extract text to clipboard instantly. | [jltrench/textify](https://github.com/jltrench/textify.git) |
+| **Lantern** | [`jobo.lantern`](plugins/jobo.lantern) | Retro monochrome CRT interactive fiction terminal emulator with bundled Zork Trilogy and analog shaders. | [OldJobobo/lantern](https://github.com/OldJobobo/lantern.git) |
+| **Drawers** | [`io.github.06chaynes.drawers`](plugins/io.github.06chaynes.drawers) | Group bar widgets into expandable drawers that host them live, with an Auto-Drawer wizard, a staged manager, and satellite alert slide-outs. | Custom / Internal |
 
 ## Installation
 

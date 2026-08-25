@@ -1,0 +1,109 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.06chaynes.drawers",
+  "name": "Drawers",
+  "version": "1.1.0",
+  "author": "Christian Haynes",
+  "license": "MIT",
+  "description": "Group bar widgets into expandable drawers, with an Auto-Drawer wizard that proposes a layout from the widgets already on your bar.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Drawer",
+    "description": "An expandable drawer that hosts other bar widgets live in a dropdown, with a staged manager and an auto-arrange wizard.",
+    "category": "Utility",
+    "allowMultiple": true,
+    "defaultSection": "right",
+    "defaults": {
+      "icon": "󰉋",
+      "label": "",
+      "showLabel": false,
+      "tooltip": "",
+      "layout": "row",
+      "columns": 2,
+      "alertMode": "slideout",
+      "alertDuration": 8,
+      "widgets": []
+    },
+    "schema": [
+      {
+        "key": "icon",
+        "type": "string",
+        "label": "Icon",
+        "defaultValue": "󰉋",
+        "description": "Nerd font glyph or icon character on the bar."
+      },
+      {
+        "key": "label",
+        "type": "string",
+        "label": "Label",
+        "defaultValue": "",
+        "description": "Optional text label displayed beside the icon."
+      },
+      {
+        "key": "showLabel",
+        "type": "boolean",
+        "label": "Show Label",
+        "defaultValue": false,
+        "description": "Whether to display the text label on the bar."
+      },
+      {
+        "key": "tooltip",
+        "type": "string",
+        "label": "Tooltip",
+        "defaultValue": "",
+        "description": "Custom tooltip on bar hover (defaults to auto-generated count)."
+      },
+      {
+        "key": "layout",
+        "type": "enum",
+        "label": "Dropdown Layout",
+        "options": [
+          "row",
+          "grid"
+        ],
+        "defaultValue": "row",
+        "description": "Single-row pill bar or compact multi-column grid card."
+      },
+      {
+        "key": "columns",
+        "type": "integer",
+        "label": "Grid Columns",
+        "min": 1,
+        "max": 6,
+        "step": 1,
+        "defaultValue": 2,
+        "description": "Number of columns when in grid layout."
+      },
+      {
+        "key": "alertMode",
+        "type": "enum",
+        "label": "Alert Notification Mode",
+        "options": [
+          "slideout",
+          "badge-only",
+          "off"
+        ],
+        "defaultValue": "slideout",
+        "description": "How alerts are surfaced: satellite icon slide-out, badge dot on drawer, or off."
+      },
+      {
+        "key": "alertDuration",
+        "type": "integer",
+        "label": "Alert Slide-out Duration (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 8,
+        "description": "How long an alerted widget stays slid out on the bar before folding back."
+      }
+    ]
+  }
+}
