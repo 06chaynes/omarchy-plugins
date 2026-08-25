@@ -25,6 +25,7 @@ A collection of third-party shell plugins and bar widgets for Omarchy.
 | **Apple Music** | [`melonamin.apple-music`](plugins/melonamin.apple-music) | Theme-aware Apple Music dropdown, compact queue, live audio spectrum, and mini-player. | [melonamin/omarchy-apple-music](https://github.com/melonamin/omarchy-apple-music.git) |
 | **Retro Library** | [`io.github.dlpwaters.retro-library`](plugins/io.github.dlpwaters.retro-library) | Console-organized RetroArch library launcher with box art and core management. | [dlpwaters/omarchy-retro-library](https://github.com/dlpwaters/omarchy-retro-library.git) |
 | **Omagotchi** | [`slcode777.omagotchi`](plugins/slcode777.omagotchi) | Virtual desktop pet widget for the status bar. | [SLcode777/omagotchi](https://github.com/SLcode777/omagotchi.git) |
+| **Omarchy Synchro** | [`harel.omarchy-synchro`](plugins/harel.omarchy-synchro) | Safe Git configuration repository manager with 1-click sync, categorized previews, and rollbacks. | [harel/omarchy-synchro](https://github.com/harel/omarchy-synchro.git) |
 
 ## Installation
 

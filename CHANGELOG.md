@@ -115,3 +115,12 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - Added Retro Library console-organized RetroArch launcher and playlist browser.
 - Multi-system navigation, local box art previews, search, favorites, and 1-click ROM/save folder actions.
 - Integrated into center bar layout.
+
+## harel.omarchy-synchro
+
+- Added 1-click atomic `sync` pipeline combining live capture, commit, and push in a single action.
+- Added categorized visual change breakdown cards (Themes, Screensavers, Terminals/WM, Scripts, Hardware).
+- Streamlined UI from 5 separate pages into a clean 3-tab layout (Dashboard, Restore & History, Settings & Policy).
+- Added comprehensive pretty-printing formatter across all status previews, seed diagnostic stages, and remote actions.
+- Updated top-bar widget with live dynamic sync state icons and status badges.
+- Integrated into right bar layout.
