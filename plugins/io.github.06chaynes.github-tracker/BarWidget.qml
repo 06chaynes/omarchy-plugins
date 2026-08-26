@@ -8,6 +8,14 @@ import qs.Ui
 BarWidget {
   id: root
   moduleName: "io.github.06chaynes.github-tracker"
+
+  // CI, review and check states carry meaning a theme must not repaint: green
+  // reads "passed", amber "running", red "failed". Red has a theme token;
+  // the other two do not, so they are pinned once here rather than scattered
+  // as literals through the file.
+  readonly property color statusOk: "#50fa7b"
+  readonly property color statusBusy: "#f1fa8c"
+  readonly property color statusBad: Color.urgent
   implicitWidth: button.implicitWidth
   implicitHeight: barSize
 
@@ -149,7 +157,7 @@ BarWidget {
         text: "󰊤"
         font.family: "Symbols Nerd Font Mono"
         font.pixelSize: Style.space(22)
-        color: root.hasAlerts ? (Color.urgent || "#ff5555") : (root.opened ? (Color.accent || "#bd93f9") : button.foreground)
+        color: root.hasAlerts ? Color.urgent : (root.opened ? Color.accent : button.foreground)
         anchors.verticalCenter: parent.verticalCenter
       }
 
@@ -164,8 +172,8 @@ BarWidget {
           height: Style.space(18)
           width: failText.implicitWidth + Style.space(8)
           radius: 4
-          color: Qt.rgba(1, 0.2, 0.2, 0.2)
-          border.color: Color.urgent || "#ff5555"
+          color: Util.alpha(root.statusBad, 0.2)
+          border.color: Color.urgent
           border.width: 1
           visible: root.stats.failingActionsCount > 0
           anchors.verticalCenter: parent.verticalCenter
@@ -177,7 +185,7 @@ BarWidget {
             font.family: "Symbols Nerd Font Mono"
             font.pixelSize: 10
             font.weight: Font.DemiBold
-            color: Color.urgent || "#ff5555"
+            color: Color.urgent
           }
         }
 
@@ -186,8 +194,8 @@ BarWidget {
           height: Style.space(18)
           width: reviewText.implicitWidth + Style.space(8)
           radius: 4
-          color: Qt.rgba(1, 0.7, 0, 0.2)
-          border.color: "#f1fa8c"
+          color: Util.alpha(root.statusBusy, 0.2)
+          border.color: root.statusBusy
           border.width: 1
           visible: root.stats.reviewRequestsCount > 0
           anchors.verticalCenter: parent.verticalCenter
@@ -199,7 +207,7 @@ BarWidget {
             font.family: "Symbols Nerd Font Mono"
             font.pixelSize: 10
             font.weight: Font.DemiBold
-            color: "#f1fa8c"
+            color: root.statusBusy
           }
         }
 
@@ -208,8 +216,8 @@ BarWidget {
           height: Style.space(18)
           width: prText.implicitWidth + Style.space(8)
           radius: 4
-          color: Qt.rgba(1, 1, 1, 0.1)
-          border.color: Qt.rgba(1, 1, 1, 0.2)
+          color: Util.alpha(Color.foreground, 0.1)
+          border.color: Util.alpha(Color.foreground, 0.2)
           border.width: 1
           visible: root.stats.myPrsCount > 0
           anchors.verticalCenter: parent.verticalCenter
@@ -221,7 +229,7 @@ BarWidget {
             font.family: "Symbols Nerd Font Mono"
             font.pixelSize: 10
             font.weight: Font.DemiBold
-            color: Color.accent || "#8be9fd"
+            color: Color.accent
           }
         }
       }
@@ -231,8 +239,8 @@ BarWidget {
         height: Style.space(18)
         width: alertOnlyText.implicitWidth + Style.space(8)
         radius: 4
-        color: Qt.rgba(1, 0.2, 0.2, 0.2)
-        border.color: Color.urgent || "#ff5555"
+        color: Util.alpha(root.statusBad, 0.2)
+        border.color: Color.urgent
         border.width: 1
         visible: root.barMode === "AlertsOnly" && root.stats.failingActionsCount > 0
         anchors.verticalCenter: parent.verticalCenter
@@ -244,7 +252,7 @@ BarWidget {
           font.family: "Symbols Nerd Font Mono"
           font.pixelSize: 10
           font.weight: Font.DemiBold
-          color: Color.urgent || "#ff5555"
+          color: Color.urgent
         }
       }
     }

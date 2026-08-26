@@ -98,6 +98,11 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - 3 cyclable bar display modes (`BadgeCounts`, `AlertsOnly`, `IconOnly`), keyboard navigation (`1`-`5`, `O`, `/`, `R`, `Esc`), and instant background cache loading.
 - Integrated into center bar layout.
 
+- Restyled the panel onto the shell's control kit, matching Rust Workspaces: the tab bar, org selector, refresh, filter field, and per-repo pin buttons now use `Ui/Button` and `Ui/TextField` instead of hand-built `Rectangle` + `MouseArea` pairs, so they inherit the theme's `[controls]` fills, borders, hover, focus, and selected states.
+- Replaced hardcoded Dracula hex fallbacks, white-based `Qt.rgba(1, 1, 1, a)` tints, and a hardcoded dropdown backdrop with `Color.*` tokens and `Util.alpha(...)`.
+- Kept CI, review, and check states semantic rather than themed — green reads "passed", amber "running", red "failed" — but pinned them as named `statusOk` / `statusBusy` / `statusBad` properties instead of scattering literals. Red maps onto the theme's `urgent` token.
+- The organisation highlight is now `Color.accent` rather than a fixed purple, since it marks selection rather than a GitHub state.
+
 ## io.github.agata.omanano
 
 - Added OmaNano Notes local-first Markdown notes library.
