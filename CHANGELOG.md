@@ -84,6 +84,9 @@ All local modifications, bug fixes, and feature additions applied to plugins in 
 - 1-click desktop actions to launch default terminal (xdg-terminal-exec), default editor (omarchy-launch-editor), and file manager (xdg-open).
 - Status bar widget with 5 right-click cyclable display modes (Size, Count, Detailed, Status, IconOnly) and middle-click rescan.
 - Integrated into center bar layout.
+- Restyled the panel onto the shell's control kit: sort, search, bulk actions, per-row actions, and the scan-root editor now use `Ui/Button` and `Ui/TextField` instead of hand-built `Rectangle` + `MouseArea` pairs, so they inherit the theme's `[controls]` fills, borders, hover, focus, and selected states.
+- Replaced hardcoded Dracula hex fallbacks and white-based `Qt.rgba(1, 1, 1, a)` tints with `Color.*` tokens and `Util.alpha(Color.foreground, a)`, so the panel follows light themes as well as dark ones.
+- Text drawn on an accent fill now uses `Color.background` rather than literal black.
 
 ## io.github.06chaynes.github-tracker
 

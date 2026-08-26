@@ -162,7 +162,7 @@ BarWidget {
         text: "\uE7A8" // Official Rust Logo
         font.family: "Symbols Nerd Font Mono"
         font.pixelSize: Style.space(22)
-        color: root.isScanning ? (Color.accent || "#ff79c6") : button.foreground
+        color: root.isScanning ? Color.accent : button.foreground
         anchors.verticalCenter: parent.verticalCenter
       }
 

@@ -260,7 +260,7 @@ Panel {
             text: "\uE7A8"
             font.family: "Symbols Nerd Font Mono"
             font.pixelSize: Style.space(24)
-            color: Color.accent || "#ff79c6"
+            color: Color.accent
           }
 
           ColumnLayout {
@@ -271,76 +271,29 @@ Panel {
               text: "Rust Workspaces"
               font.pixelSize: Style.space(15)
               font.weight: Font.Bold
-              color: Color.foreground || "#f8f8f2"
+              color: Color.foreground
             }
 
             Text {
               text: root.count + " workspaces • " + root.totalReclaimable + " reclaimable"
               font.pixelSize: Style.space(11)
-              color: Color.muted || "#6272a4"
+              color: Color.muted
             }
           }
 
-          // Rescan button
-          Rectangle {
-            width: Style.space(30)
-            height: Style.space(30)
-            radius: 4
-            color: rescanMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.08)
-            border.color: Qt.rgba(1, 1, 1, 0.2)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "\uF01E"
-              font.family: "Symbols Nerd Font Mono"
-              font.pixelSize: Style.space(13)
-              color: Color.foreground || "#f8f8f2"
-            }
-
-            MouseArea {
-              id: rescanMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.rescan()
-            }
-
-            PanelToolTip {
-              visible: rescanMa.containsMouse
-              text: "Rescan all Rust workspaces"
-            }
+          Button {
+            iconText: "\uF01E"
+            tooltipText: "Rescan all Rust workspaces"
+            bordered: true
+            onClicked: root.rescan()
           }
 
-          // Settings toggle button
-          Rectangle {
-            width: Style.space(30)
-            height: Style.space(30)
-            radius: 4
-            color: root.showSettings ? (Color.accent || "#ff79c6") : (settingsMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.08))
-            border.color: Qt.rgba(1, 1, 1, 0.2)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "\uF013"
-              font.family: "Symbols Nerd Font Mono"
-              font.pixelSize: Style.space(13)
-              color: root.showSettings ? "#000000" : (Color.foreground || "#f8f8f2")
-            }
-
-            MouseArea {
-              id: settingsMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.showSettings = !root.showSettings
-            }
-
-            PanelToolTip {
-              visible: settingsMa.containsMouse
-              text: root.showSettings ? "Back to workspaces list" : "Configure scan root directories"
-            }
+          Button {
+            iconText: "\uF013"
+            tooltipText: root.showSettings ? "Back to workspaces list" : "Configure scan root directories"
+            bordered: true
+            selected: root.showSettings
+            onClicked: root.showSettings = !root.showSettings
           }
         }
 
@@ -350,139 +303,36 @@ Panel {
           spacing: Style.space(6)
           visible: !root.showSettings
 
-          Rectangle {
+          // The kit's field carries the theme's focus border and selection
+          // tint; the Rectangle + TextInput it replaces carried neither.
+          TextField {
+            id: searchInput
             Layout.fillWidth: true
-            height: Style.space(30)
-            radius: 4
-            color: Qt.rgba(1, 1, 1, 0.06)
-            border.color: searchInput.activeFocus ? (Color.accent || "#ff79c6") : Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(8)
-              anchors.rightMargin: Style.space(8)
-              spacing: Style.space(6)
-
-              Text {
-                text: "\uF002"
-                font.family: "Symbols Nerd Font Mono"
-                font.pixelSize: Style.space(12)
-                color: Color.muted || "#6272a4"
-              }
-
-              TextInput {
-                id: searchInput
-                Layout.fillWidth: true
-                font.pixelSize: Style.space(12)
-                color: Color.foreground || "#f8f8f2"
-                clip: true
-                onTextChanged: {
-                  root.searchQuery = text;
-                  root.filterAndSort();
-                }
-
-                Text {
-                  anchors.fill: parent
-                  text: "Filter workspaces or paths..."
-                  font.pixelSize: Style.space(12)
-                  color: Color.muted || "#6272a4"
-                  visible: !searchInput.text && !searchInput.activeFocus
-                }
-              }
+            placeholderText: "Filter workspaces or paths…"
+            verticalPadding: Style.space(4)
+            onTextChanged: {
+              root.searchQuery = text;
+              root.filterAndSort();
             }
           }
 
-          // Sort Size
-          Rectangle {
-            width: Style.space(48)
-            height: Style.space(30)
-            radius: 4
-            color: root.sortMode === "size" ? Qt.rgba(1, 1, 1, 0.2) : (sortSizeMa.containsMouse ? Qt.rgba(1, 1, 1, 0.1) : "transparent")
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
+          // Sort modes. Ui/Button carries the theme's [controls] fills,
+          // borders and selected state; the hand-rolled rectangles this
+          // replaces ignored all of it.
+          Repeater {
+            model: [
+              { mode: "size", label: "Size", tip: "Sort by largest reclaimable target size" },
+              { mode: "age",  label: "Age",  tip: "Sort by days since last build (oldest first)" },
+              { mode: "name", label: "Name", tip: "Sort alphabetically by workspace name" }
+            ]
 
-            Text {
-              anchors.centerIn: parent
-              text: "Size"
-              font.pixelSize: Style.space(11)
-              font.weight: root.sortMode === "size" ? Font.Bold : Font.Normal
-              color: root.sortMode === "size" ? (Color.accent || "#ff79c6") : (Color.foreground || "#f8f8f2")
-            }
-
-            MouseArea {
-              id: sortSizeMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: { root.sortMode = "size"; root.filterAndSort(); }
-            }
-
-            PanelToolTip {
-              visible: sortSizeMa.containsMouse
-              text: "Sort by largest reclaimable target size"
-            }
-          }
-
-          // Sort Age
-          Rectangle {
-            width: Style.space(44)
-            height: Style.space(30)
-            radius: 4
-            color: root.sortMode === "age" ? Qt.rgba(1, 1, 1, 0.2) : (sortAgeMa.containsMouse ? Qt.rgba(1, 1, 1, 0.1) : "transparent")
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "Age"
-              font.pixelSize: Style.space(11)
-              font.weight: root.sortMode === "age" ? Font.Bold : Font.Normal
-              color: root.sortMode === "age" ? (Color.accent || "#ff79c6") : (Color.foreground || "#f8f8f2")
-            }
-
-            MouseArea {
-              id: sortAgeMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: { root.sortMode = "age"; root.filterAndSort(); }
-            }
-
-            PanelToolTip {
-              visible: sortAgeMa.containsMouse
-              text: "Sort by days since last build (oldest first)"
-            }
-          }
-
-          // Sort Name
-          Rectangle {
-            width: Style.space(50)
-            height: Style.space(30)
-            radius: 4
-            color: root.sortMode === "name" ? Qt.rgba(1, 1, 1, 0.2) : (sortNameMa.containsMouse ? Qt.rgba(1, 1, 1, 0.1) : "transparent")
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "Name"
-              font.pixelSize: Style.space(11)
-              font.weight: root.sortMode === "name" ? Font.Bold : Font.Normal
-              color: root.sortMode === "name" ? (Color.accent || "#ff79c6") : (Color.foreground || "#f8f8f2")
-            }
-
-            MouseArea {
-              id: sortNameMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: { root.sortMode = "name"; root.filterAndSort(); }
-            }
-
-            PanelToolTip {
-              visible: sortNameMa.containsMouse
-              text: "Sort alphabetically by workspace name"
+            delegate: Button {
+              required property var modelData
+              text: modelData.label
+              tooltipText: modelData.tip
+              bordered: true
+              selected: root.sortMode === modelData.mode
+              onClicked: { root.sortMode = modelData.mode; root.filterAndSort(); }
             }
           }
         }
@@ -493,124 +343,36 @@ Panel {
           spacing: Style.space(6)
           visible: !root.showSettings
 
-          Rectangle {
-            width: Style.space(86)
-            height: Style.space(26)
-            radius: 4
-            color: selectAllMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.08)
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "\uF00C Select All"
-              font.family: "Symbols Nerd Font Mono"
-              font.pixelSize: Style.space(11)
-              color: Color.foreground || "#f8f8f2"
-            }
-
-            MouseArea {
-              id: selectAllMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.selectAll()
-            }
-
-            PanelToolTip {
-              visible: selectAllMa.containsMouse
-              text: "Select all workspaces with uncleaned target builds"
-            }
+          Button {
+            text: "\uF00C Select All"
+            tooltipText: "Select all workspaces with uncleaned target builds"
+            bordered: true
+            onClicked: root.selectAll()
           }
 
-          Rectangle {
-            width: Style.space(56)
-            height: Style.space(26)
-            radius: 4
+          Button {
             visible: root.selectedCount() > 0
-            color: clearSelMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.08)
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "Clear"
-              font.pixelSize: Style.space(11)
-              color: Color.muted || "#6272a4"
-            }
-
-            MouseArea {
-              id: clearSelMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.deselectAll()
-            }
-
-            PanelToolTip {
-              visible: clearSelMa.containsMouse
-              text: "Clear all selected checkboxes"
-            }
+            text: "Clear"
+            tooltipText: "Clear all selected checkboxes"
+            bordered: true
+            onClicked: root.deselectAll()
           }
 
-          Rectangle {
+          Button {
             Layout.fillWidth: true
-            height: Style.space(26)
-            radius: 4
             visible: root.selectedCount() > 0
-            color: cleanSelMa.containsMouse ? (Color.accent || "#ff79c6") : Qt.rgba(Color.accent.r || 1, Color.accent.g || 0.4, Color.accent.b || 0.7, 0.8)
-
-            Text {
-              anchors.centerIn: parent
-              text: "\uF0E2 Clean Selected (" + root.selectedCount() + ")"
-              font.family: "Symbols Nerd Font Mono"
-              font.pixelSize: Style.space(11)
-              font.weight: Font.Bold
-              color: "#000000"
-            }
-
-            MouseArea {
-              id: cleanSelMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.cleanSelected()
-            }
-
-            PanelToolTip {
-              visible: cleanSelMa.containsMouse
-              text: "Run cargo clean on all " + root.selectedCount() + " selected workspaces"
-            }
+            text: "\uF0E2 Clean Selected (" + root.selectedCount() + ")"
+            tooltipText: "Run cargo clean on all " + root.selectedCount() + " selected workspaces"
+            active: true
+            onClicked: root.cleanSelected()
           }
 
-          Rectangle {
+          Button {
             Layout.fillWidth: root.selectedCount() === 0
-            height: Style.space(26)
-            radius: 4
-            color: cleanStaleMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.08)
-            border.color: Qt.rgba(1, 1, 1, 0.15)
-            border.width: 1
-
-            Text {
-              anchors.centerIn: parent
-              text: "\uF017 Clean Stale (>14d)"
-              font.family: "Symbols Nerd Font Mono"
-              font.pixelSize: Style.space(11)
-              color: Color.foreground || "#f8f8f2"
-            }
-
-            MouseArea {
-              id: cleanStaleMa
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onClicked: root.cleanStale()
-            }
-
-            PanelToolTip {
-              visible: cleanStaleMa.containsMouse
-              text: "Clean targets that have not been built in over 14 days"
-            }
+            text: "\uF017 Clean Stale (>14d)"
+            tooltipText: "Clean workspaces not built in over 14 days"
+            bordered: true
+            onClicked: root.cleanStale()
           }
         }
 
@@ -625,7 +387,7 @@ Panel {
             text: "Scan Roots Configuration"
             font.pixelSize: Style.space(13)
             font.weight: Font.Bold
-            color: Color.foreground || "#f8f8f2"
+            color: Color.foreground
           }
 
           RowLayout {
@@ -636,8 +398,8 @@ Panel {
               Layout.fillWidth: true
               height: Style.space(32)
               radius: 4
-              color: Qt.rgba(1, 1, 1, 0.06)
-              border.color: addRootInput.activeFocus ? (Color.accent || "#ff79c6") : Qt.rgba(1, 1, 1, 0.15)
+              color: Util.alpha(Color.foreground, 0.06)
+              border.color: addRootInput.activeFocus ? Color.accent : Util.alpha(Color.foreground, 0.15)
               border.width: 1
 
               TextInput {
@@ -645,47 +407,26 @@ Panel {
                 anchors.fill: parent
                 anchors.margins: Style.space(6)
                 font.pixelSize: Style.space(12)
-                color: Color.foreground || "#f8f8f2"
+                color: Color.foreground
                 clip: true
 
                 Text {
                   anchors.fill: parent
                   text: "~/Projects or /path/to/code"
                   font.pixelSize: Style.space(12)
-                  color: Color.muted || "#6272a4"
+                  color: Color.muted
                   visible: !addRootInput.text && !addRootInput.activeFocus
                 }
               }
             }
 
-            Rectangle {
-              width: Style.space(90)
-              height: Style.space(32)
-              radius: 4
-              color: addRootMa.containsMouse ? (Color.accent || "#ff79c6") : Qt.rgba(Color.accent.r || 1, Color.accent.g || 0.4, Color.accent.b || 0.7, 0.8)
-
-              Text {
-                anchors.centerIn: parent
-                text: "+ Add Root"
-                font.pixelSize: Style.space(11)
-                font.weight: Font.Bold
-                color: "#000000"
-              }
-
-              MouseArea {
-                id: addRootMa
-                anchors.fill: parent
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
-                onClicked: {
-                  root.addRoot(addRootInput.text);
-                  addRootInput.text = "";
-                }
-              }
-
-              PanelToolTip {
-                visible: addRootMa.containsMouse
-                text: "Add directory to permanent scan roots"
+            Button {
+              text: "+ Add Root"
+              tooltipText: "Add directory to permanent scan roots"
+              active: true
+              onClicked: {
+                root.addRoot(addRootInput.text);
+                addRootInput.text = "";
               }
             }
           }
@@ -699,8 +440,8 @@ Panel {
             delegate: Rectangle {
               width: ListView.view.width
               height: Style.space(36)
-              color: Qt.rgba(1, 1, 1, 0.04)
-              border.color: Qt.rgba(1, 1, 1, 0.1)
+              color: Util.alpha(Color.foreground, 0.04)
+              border.color: Util.alpha(Color.foreground, 0.1)
               border.width: 1
               radius: 4
 
@@ -713,36 +454,17 @@ Panel {
                   Layout.fillWidth: true
                   text: modelData
                   font.pixelSize: Style.space(12)
-                  color: Color.foreground || "#f8f8f2"
+                  color: Color.foreground
                   elide: Text.ElideMiddle
                 }
 
-                Rectangle {
-                  width: Style.space(24)
-                  height: Style.space(24)
-                  radius: 3
-                  color: remRootMa.containsMouse ? Qt.rgba(1, 0, 0, 0.3) : "transparent"
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "\uF00D"
-                    font.family: "Symbols Nerd Font Mono"
-                    font.pixelSize: Style.space(12)
-                    color: Color.urgent || "#ff5555"
-                  }
-
-                  MouseArea {
-                    id: remRootMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.removeRoot(modelData)
-                  }
-
-                  PanelToolTip {
-                    visible: remRootMa.containsMouse
-                    text: "Remove this directory from scan roots"
-                  }
+                Button {
+                  iconText: "\uF00D"
+                  tooltipText: "Remove this scan root"
+                  foreground: Color.urgent
+                  verticalPadding: Style.space(2)
+                  horizontalPadding: Style.space(6)
+                  onClicked: root.removeRoot(modelData)
                 }
               }
             }
@@ -764,8 +486,8 @@ Panel {
             width: wsList.width
             height: Style.space(86)
             radius: 6
-            color: Qt.rgba(1, 1, 1, 0.05)
-            border.color: root.selectedPaths[modelData.path] ? (Color.accent || "#ff79c6") : Qt.rgba(1, 1, 1, 0.1)
+            color: Util.alpha(Color.foreground, 0.05)
+            border.color: root.selectedPaths[modelData.path] ? Color.accent : Util.alpha(Color.foreground, 0.1)
             border.width: root.selectedPaths[modelData.path] ? 2 : 1
 
             ColumnLayout {
@@ -783,8 +505,8 @@ Panel {
                   width: Style.space(16)
                   height: Style.space(16)
                   radius: 3
-                  color: root.selectedPaths[modelData.path] ? (Color.accent || "#ff79c6") : "transparent"
-                  border.color: modelData.hasTarget ? (Color.accent || "#ff79c6") : Qt.rgba(1, 1, 1, 0.2)
+                  color: root.selectedPaths[modelData.path] ? Color.accent : "transparent"
+                  border.color: modelData.hasTarget ? Color.accent : Util.alpha(Color.foreground, 0.2)
                   border.width: 1
                   opacity: modelData.hasTarget ? 1.0 : 0.3
 
@@ -793,7 +515,7 @@ Panel {
                     text: "\uF00C"
                     font.family: "Symbols Nerd Font Mono"
                     font.pixelSize: Style.space(10)
-                    color: "#000000"
+                    color: Color.background
                     visible: root.selectedPaths[modelData.path] === true
                   }
 
@@ -816,21 +538,21 @@ Panel {
                   text: modelData.name
                   font.pixelSize: Style.space(13)
                   font.weight: Font.Bold
-                  color: Color.foreground || "#f8f8f2"
+                  color: Color.foreground
                   elide: Text.ElideRight
                 }
 
                 Text {
                   text: modelData.version ? "v" + modelData.version : ""
                   font.pixelSize: Style.space(11)
-                  color: Color.muted || "#6272a4"
+                  color: Color.muted
                   visible: modelData.version !== ""
                 }
 
                 Rectangle {
                   visible: modelData.isWorkspace === true
                   radius: 3
-                  color: Qt.rgba(0.9, 0.4, 0.2, 0.2)
+                  color: Util.alpha(Color.urgent, 0.2)
                   implicitWidth: wsBadgeText.implicitWidth + Style.space(8)
                   implicitHeight: wsBadgeText.implicitHeight + Style.space(4)
                   Text {
@@ -838,14 +560,14 @@ Panel {
                     anchors.centerIn: parent
                     text: "workspace"
                     font.pixelSize: Style.space(10)
-                    color: Color.accent || "#ff79c6"
+                    color: Color.accent
                   }
                 }
 
                 Rectangle {
                   visible: modelData.gitBranch !== null && modelData.gitBranch !== ""
                   radius: 3
-                  color: Qt.rgba(1, 1, 1, 0.1)
+                  color: Util.alpha(Color.foreground, 0.1)
                   implicitWidth: gitBadgeText.implicitWidth + Style.space(8)
                   implicitHeight: gitBadgeText.implicitHeight + Style.space(4)
                   Text {
@@ -854,7 +576,7 @@ Panel {
                     text: "\uF126 " + (modelData.gitBranch || "")
                     font.family: "Symbols Nerd Font Mono"
                     font.pixelSize: Style.space(10)
-                    color: Color.foreground || "#f8f8f2"
+                    color: Color.foreground
                   }
                 }
 
@@ -864,7 +586,7 @@ Panel {
                   text: modelData.targetDisplay
                   font.pixelSize: Style.space(13)
                   font.weight: Font.Bold
-                  color: modelData.hasTarget ? (Color.accent || "#ff79c6") : (Color.muted || "#6272a4")
+                  color: modelData.hasTarget ? Color.accent : Color.muted
                 }
               }
 
@@ -877,14 +599,14 @@ Panel {
                   Layout.fillWidth: true
                   text: modelData.displayPath
                   font.pixelSize: Style.space(11)
-                  color: Color.muted || "#6272a4"
+                  color: Color.muted
                   elide: Text.ElideMiddle
                 }
 
                 Text {
                   text: modelData.daysSinceBuild >= 0 ? ("Built " + modelData.daysSinceBuild + "d ago") : "Clean"
                   font.pixelSize: Style.space(11)
-                  color: modelData.daysSinceBuild > 14 ? (Color.urgent || "#ff5555") : (Color.muted || "#6272a4")
+                  color: modelData.daysSinceBuild > 14 ? Color.urgent : Color.muted
                 }
               }
 
@@ -896,129 +618,50 @@ Panel {
                 Text {
                   text: "Source: " + modelData.sourceDisplay
                   font.pixelSize: Style.space(10)
-                  color: Color.muted || "#6272a4"
+                  color: Color.muted
                 }
 
                 Item { Layout.fillWidth: true }
 
                 // Clean button
-                Rectangle {
-                  width: Style.space(62)
-                  height: Style.space(22)
-                  radius: 3
+                Button {
                   visible: modelData.hasTarget
-                  color: singleCleanMa.containsMouse ? (Color.accent || "#ff79c6") : Qt.rgba(Color.accent.r || 1, Color.accent.g || 0.4, Color.accent.b || 0.7, 0.2)
-                  border.color: Color.accent || "#ff79c6"
-                  border.width: 1
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "\uF0E2 Clean"
-                    font.family: "Symbols Nerd Font Mono"
-                    font.pixelSize: Style.space(10)
-                    font.weight: Font.Bold
-                    color: singleCleanMa.containsMouse ? "#000000" : (Color.accent || "#ff79c6")
-                  }
-
-                  MouseArea {
-                    id: singleCleanMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.cleanSingle(modelData.path)
-                  }
-
-                  PanelToolTip {
-                    visible: singleCleanMa.containsMouse
-                    text: "Run cargo clean on " + modelData.name + " (" + modelData.targetDisplay + ")"
-                  }
+                  text: "\uF0E2 Clean"
+                  tooltipText: "Run cargo clean on " + modelData.name + " (" + modelData.targetDisplay + ")"
+                  bordered: true
+                  verticalPadding: Style.space(2)
+                  horizontalPadding: Style.space(8)
+                  onClicked: root.cleanSingle(modelData.path)
                 }
 
                 // Terminal
-                Rectangle {
-                  width: Style.space(26)
-                  height: Style.space(22)
-                  radius: 3
-                  color: termMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.06)
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "\uEA85"
-                    font.family: "Symbols Nerd Font Mono"
-                    font.pixelSize: Style.space(12)
-                    color: Color.foreground || "#f8f8f2"
-                  }
-
-                  MouseArea {
-                    id: termMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.openTerm(modelData.path)
-                  }
-
-                  PanelToolTip {
-                    visible: termMa.containsMouse
-                    text: "Open terminal in " + modelData.displayPath
-                  }
+                Button {
+                  iconText: "\uEA85"
+                  tooltipText: "Open terminal in " + modelData.displayPath
+                  bordered: true
+                  verticalPadding: Style.space(2)
+                  horizontalPadding: Style.space(6)
+                  onClicked: root.openTerm(modelData.path)
                 }
 
                 // Editor
-                Rectangle {
-                  width: Style.space(26)
-                  height: Style.space(22)
-                  radius: 3
-                  color: editMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.06)
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "\uF044"
-                    font.family: "Symbols Nerd Font Mono"
-                    font.pixelSize: Style.space(12)
-                    color: Color.foreground || "#f8f8f2"
-                  }
-
-                  MouseArea {
-                    id: editMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.openEditor(modelData.path)
-                  }
-
-                  PanelToolTip {
-                    visible: editMa.containsMouse
-                    text: "Open project in default code editor"
-                  }
+                Button {
+                  iconText: "\uF044"
+                  tooltipText: "Open project in default code editor"
+                  bordered: true
+                  verticalPadding: Style.space(2)
+                  horizontalPadding: Style.space(6)
+                  onClicked: root.openEditor(modelData.path)
                 }
 
                 // Files
-                Rectangle {
-                  width: Style.space(26)
-                  height: Style.space(22)
-                  radius: 3
-                  color: filesMa.containsMouse ? Qt.rgba(1, 1, 1, 0.15) : Qt.rgba(1, 1, 1, 0.06)
-
-                  Text {
-                    anchors.centerIn: parent
-                    text: "\uF07B"
-                    font.family: "Symbols Nerd Font Mono"
-                    font.pixelSize: Style.space(12)
-                    color: Color.foreground || "#f8f8f2"
-                  }
-
-                  MouseArea {
-                    id: filesMa
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.openFiles(modelData.path)
-                  }
-
-                  PanelToolTip {
-                    visible: filesMa.containsMouse
-                    text: "Reveal folder in file manager"
-                  }
+                Button {
+                  iconText: "\uF07B"
+                  tooltipText: "Reveal folder in file manager"
+                  bordered: true
+                  verticalPadding: Style.space(2)
+                  horizontalPadding: Style.space(6)
+                  onClicked: root.openFiles(modelData.path)
                 }
               }
             }
