@@ -138,8 +138,31 @@ function parseDisk(raw, devices) {
   return found ? { readBytes: readSectors * 512, writeBytes: writeSectors * 512 } : null
 }
 
+function shortGpuName(raw) {
+  // lspci gives e.g. "... [AMD/ATI] Navi 31 [Radeon RX 7900 XT/7900 XTX/7900
+  // GRE/7900M]". One PCI id covers several retail models, so the variant
+  // cannot be resolved here — name the family rather than assert a model the
+  // system cannot confirm.
+  var text = String(raw || "").trim()
+  var brackets = text.match(/\[([^\]]+)\]/g)
+  if (!brackets || !brackets.length) return text
+  var inner = brackets[brackets.length - 1].slice(1, -1).trim()
+  if (/AMD\/ATI|NVIDIA|Intel/i.test(inner)) return text
+  if (inner.indexOf("/") >= 0) {
+    // "Radeon RX 7900 XT/7900 XTX/..." -> "Radeon RX 7900"
+    var head = inner.split("/")[0].trim().split(/\s+/)
+    if (head.length > 1) head.pop()
+    return head.join(" ")
+  }
+  return inner
+}
+
 function parseDiscovery(raw) {
-  var result = { cpuTempPath: "", devices: [] }
+  var result = {
+    cpuTempPath: "", devices: [],
+    gpuBusyPath: "", gpuVramUsedPath: "", gpuVramTotalPath: "",
+    gpuTempPath: "", gpuPowerPath: "", gpuName: ""
+  }
   var lines = String(raw || "").split("\n")
   for (var i = 0; i < lines.length; i++) {
     var separator = lines[i].indexOf("\t")
@@ -148,6 +171,12 @@ function parseDiscovery(raw) {
     var value = lines[i].slice(separator + 1).trim()
     if (key === "cpu_temp") result.cpuTempPath = value
     else if (key === "disk" && value !== "") result.devices.push(value)
+    else if (key === "gpu_busy") result.gpuBusyPath = value
+    else if (key === "gpu_vram_used") result.gpuVramUsedPath = value
+    else if (key === "gpu_vram_total") result.gpuVramTotalPath = value
+    else if (key === "gpu_temp") result.gpuTempPath = value
+    else if (key === "gpu_power") result.gpuPowerPath = value
+    else if (key === "gpu_name") result.gpuName = shortGpuName(value)
   }
   return result
 }

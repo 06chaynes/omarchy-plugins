@@ -242,9 +242,14 @@ Panel {
     actionProc.running = true
   }
 
-  function launchSelected() {
+  function launchSelected(windowed) {
     if (!selectedGame || actionBusy) return
-    runAction("launch", ["launch", "--path", String(selectedGame.path), "--core", selectedCorePath])
+    var argv = ["launch", "--path", String(selectedGame.path), "--core", selectedCorePath]
+    // Tiled rather than fullscreen. RetroArch re-requests fullscreen once the
+    // core loads, so the helper holds the window in the layout for a few
+    // seconds; Super+T then floats it like any other window.
+    if (windowed === true) argv.push("--windowed")
+    runAction("launch", argv)
   }
 
   function toggleFavorite() {
@@ -803,18 +808,39 @@ Panel {
 
               Item { width: 1; height: Style.space(2) }
 
-              Button {
+              // Side by side: the detail pane is a fixed-height clipping
+              // surface, so a third stacked button falls below the fold.
+              Row {
                 width: parent.width
-                text: root.actionBusy && root.actionKind === "launch" ? "Launching…" : "Play"
-                iconText: "󰐊"
-                foreground: root.foreground
-                accent: root.accent
-                selected: true
-                bordered: true
-                focusable: true
-                enabled: !root.actionBusy && root.selectedGame
+                spacing: Style.space(6)
+
+                readonly property bool playable: !root.actionBusy && root.selectedGame
                   && root.selectedGame.content_available && root.selectedGame.core_available
-                onClicked: root.launchSelected()
+
+                Button {
+                  width: (parent.width - parent.spacing) * 0.62
+                  text: root.actionBusy && root.actionKind === "launch" ? "Launching…" : "Play"
+                  iconText: "󰐊"
+                  foreground: root.foreground
+                  accent: root.accent
+                  selected: true
+                  bordered: true
+                  focusable: true
+                  enabled: parent.playable
+                  onClicked: root.launchSelected()
+                }
+
+                Button {
+                  width: (parent.width - parent.spacing) * 0.38
+                  text: "Windowed"
+                  iconText: "󰖯"
+                  foreground: root.foreground
+                  accent: root.accent
+                  bordered: true
+                  focusable: true
+                  enabled: parent.playable
+                  onClicked: root.launchSelected(true)
+                }
               }
 
               Button {

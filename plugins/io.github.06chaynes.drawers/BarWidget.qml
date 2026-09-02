@@ -282,6 +282,19 @@ BarWidget {
             id: slotGrid
             anchors.centerIn: parent
             spacing: Style.space(8)
+
+            // The popup's content is laid out in the bar's scene even while the
+            // popup is closed, at the bar's left edge (x=8,48,88,... y=10) --
+            // invisible, but underneath the real icons and still hit-testable,
+            // so a click in a gap of the workspace switcher lands on whichever
+            // tucked widget occupies that x. Gating `enabled` does not help:
+            // WidgetButton's own MouseArea carries `enabled: root.interactive`,
+            // which defaults true.
+            //
+            // `visible` is what removes an item from hit-testing. Delegates are
+            // still created (visible:false does not stop that), so the drawer's
+            // widgets stay live -- only their input and painting stop.
+            visible: root.popupOpen
             columns: root.drawerLayout === "grid"
                 ? Math.max(1, root.gridColumns)
                 : Math.max(1, root.widgetList.length + 1)

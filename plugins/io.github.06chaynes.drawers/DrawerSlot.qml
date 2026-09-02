@@ -9,6 +9,9 @@ Item {
     property var bar: null
     property var hostDrawer: null
 
+
+
+
     readonly property string moduleId: entry && entry.id ? String(entry.id) : ""
     readonly property var moduleSettings: entry && entry.settings ? entry.settings : ({})
     readonly property bool hasModule: moduleId.length > 0
@@ -97,6 +100,22 @@ Item {
         var anchor = slot.hostDrawer && slot.hostDrawer.barAnchorItem
             ? slot.hostDrawer.barAnchorItem : null
         if (!anchor) return
+
+        // A Loader's instantiated object is NOT in `data` — it is `loader.item`.
+        // Walking only `data` therefore never reaches a panel that its widget
+        // creates through a Loader, so that panel keeps the anchor its own
+        // BarWidget assigned (its in-drawer button). With the drawer collapsed
+        // that button is not laid out in the bar, so the panel — and its input
+        // region — lands at the bar origin, on top of the workspace switcher:
+        // clicking a workspace then opens the drawer's widget instead.
+        try {
+            if ("item" in node && node.item) {
+                var loaded = node.item
+                if ("anchorItem" in loaded && loaded.anchorItem !== anchor) loaded.anchorItem = anchor
+                repointPanels(loaded, depth + 1)
+            }
+        } catch (e) {}
+
         var kids = node.data
         if (!kids || kids.length === undefined) return
         for (var i = 0; i < kids.length; i++) {

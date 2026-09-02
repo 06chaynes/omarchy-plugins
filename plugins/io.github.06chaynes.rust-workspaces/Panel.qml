@@ -19,6 +19,7 @@ Panel {
   property var rawData: ({})
   property var workspaces: []
   property var scanRoots: []
+  property int staleDays: 14
   property string totalReclaimable: "0 B"
   property string totalSource: "0 B"
   property int count: 0
@@ -26,7 +27,6 @@ Panel {
   property string sortMode: "size" // "size", "age", "name"
   property var selectedPaths: ({})
   property bool showSettings: false
-  property string newRootInput: ""
   property bool isBusy: false
   property string statusMessage: ""
 
@@ -61,6 +61,7 @@ Panel {
     root.totalSource = data.totalSourceDisplay || "0 B";
     root.count = data.count || 0;
     root.scanRoots = data.scanRoots || [];
+    if (data.staleDaysThreshold > 0) root.staleDays = data.staleDaysThreshold;
     filterAndSort();
   }
 
@@ -115,9 +116,9 @@ Panel {
 
   function cleanStale() {
     root.isBusy = true;
-    root.statusMessage = "Cleaning stale targets (>14 days)...";
+    root.statusMessage = "Cleaning stale targets (>" + root.staleDays + " days)...";
     cleanProc.running = false;
-    cleanProc.command = [root.helperPath, "clean-stale", "14"];
+    cleanProc.command = [root.helperPath, "clean-stale", String(root.staleDays)];
     cleanProc.running = true;
   }
 
@@ -145,34 +146,20 @@ Panel {
     return Object.keys(root.selectedPaths).filter(function(k) { return root.selectedPaths[k] === true; }).length;
   }
 
+  // Util.execArgv, not bar.run: the latter takes a shell string, and pasting a
+  // path into one breaks on spaces and executes anything a directory name
+  // happens to contain. execArgv passes argv through positional parameters,
+  // which bash does not re-tokenize.
   function openTerm(path) {
-    if (root.bar && typeof root.bar.run === "function") {
-      root.bar.run("uwsm-app -- xdg-terminal-exec --dir=" + path);
-    } else {
-      actionProc.running = false;
-      actionProc.command = [root.helperPath, "open-term", path];
-      actionProc.running = true;
-    }
+    Util.execArgv(["uwsm-app", "--", "xdg-terminal-exec", "--dir=" + path]);
   }
 
   function openEditor(path) {
-    if (root.bar && typeof root.bar.run === "function") {
-      root.bar.run("omarchy-launch-editor " + path);
-    } else {
-      actionProc.running = false;
-      actionProc.command = [root.helperPath, "open-editor", path];
-      actionProc.running = true;
-    }
+    Util.execArgv(["omarchy-launch-editor", path]);
   }
 
   function openFiles(path) {
-    if (root.bar && typeof root.bar.run === "function") {
-      root.bar.run("xdg-open " + path);
-    } else {
-      actionProc.running = false;
-      actionProc.command = [root.helperPath, "open-files", path];
-      actionProc.running = true;
-    }
+    Util.execArgv(["xdg-open", path]);
   }
 
   function addRoot(path) {
@@ -180,7 +167,6 @@ Panel {
     root.isBusy = true;
     rootsProc.command = [root.helperPath, "roots-add", path.trim()];
     rootsProc.running = true;
-    root.newRootInput = "";
   }
 
   function removeRoot(path) {
@@ -189,21 +175,40 @@ Panel {
     rootsProc.running = true;
   }
 
+  Timer {
+    id: statusClear
+    interval: 6000
+    onTriggered: root.statusMessage = ""
+  }
+
   Process {
     id: cleanProc
+    // Read the result here but rescan only in onExited. Both handlers fire, so
+    // rescanning in each one ran a full filesystem scan twice per clean.
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.isBusy = false;
-        root.statusMessage = "";
         root.selectedPaths = ({});
-        root.rescan();
+        var raw = String(text || "").trim();
+        if (!raw) return;
+        try {
+          var data = JSON.parse(raw);
+          if (data.ok === false && data.error) {
+            root.statusMessage = data.error;
+          } else if (data.skipped && data.skipped.length > 0) {
+            root.statusMessage = "Left alone, not a cargo target dir: " + data.skipped.join(", ");
+          } else if (data.reclaimedDisplay) {
+            root.statusMessage = "Reclaimed " + data.reclaimedDisplay;
+          }
+        } catch(e) {
+          root.statusMessage = "Could not read the cleaner's response";
+        }
       }
     }
     onExited: {
       root.isBusy = false;
-      root.statusMessage = "";
       root.rescan();
+      statusClear.restart();
     }
   }
 
@@ -212,20 +217,16 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        root.isBusy = false;
         var raw = String(text || "").trim();
-        if (raw) {
-          try {
-            var data = JSON.parse(raw);
-            root.updateData(data);
-          } catch(e) {}
-        }
+        if (!raw) return;
+        try {
+          root.updateData(JSON.parse(raw));
+        } catch(e) {}
       }
     }
-  }
-
-  Process {
-    id: actionProc
+    // Without this the busy flag sticks whenever the helper fails to start or
+    // exits without writing anything.
+    onExited: root.isBusy = false
   }
 
   KeyboardPanel {
@@ -294,6 +295,29 @@ Panel {
             bordered: true
             selected: root.showSettings
             onClicked: root.showSettings = !root.showSettings
+          }
+        }
+
+        // isBusy and statusMessage were set by every action but rendered
+        // nowhere, so cleaning a large target looked like nothing happened.
+        Rectangle {
+          Layout.fillWidth: true
+          visible: root.statusMessage !== ""
+          radius: 4
+          color: Util.alpha(Color.foreground, 0.06)
+          implicitHeight: statusText.implicitHeight + Style.space(10)
+
+          Text {
+            id: statusText
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(8)
+            anchors.rightMargin: Style.space(8)
+            text: root.statusMessage
+            font.pixelSize: Style.space(11)
+            color: root.isBusy ? Color.muted : Color.foreground
+            wrapMode: Text.WordWrap
           }
         }
 
@@ -369,8 +393,8 @@ Panel {
 
           Button {
             Layout.fillWidth: root.selectedCount() === 0
-            text: "\uF017 Clean Stale (>14d)"
-            tooltipText: "Clean workspaces not built in over 14 days"
+            text: "\uF017 Clean Stale (>" + root.staleDays + "d)"
+            tooltipText: "Clean workspaces not built in over " + root.staleDays + " days"
             bordered: true
             onClicked: root.cleanStale()
           }
@@ -606,7 +630,7 @@ Panel {
                 Text {
                   text: modelData.daysSinceBuild >= 0 ? ("Built " + modelData.daysSinceBuild + "d ago") : "Clean"
                   font.pixelSize: Style.space(11)
-                  color: modelData.daysSinceBuild > 14 ? Color.urgent : Color.muted
+                  color: modelData.daysSinceBuild > root.staleDays ? Color.urgent : Color.muted
                 }
               }
 

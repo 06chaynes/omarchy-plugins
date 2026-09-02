@@ -111,6 +111,17 @@ Panel {
     return one(metrics.loadOne) + " / " + one(metrics.loadFive) + " / " + one(metrics.loadFifteen)
   }
 
+  function vramPercent() {
+    if (!(metrics.gpuVramTotal > 0)) return -1
+    return Math.max(0, Math.min(100, metrics.gpuVramUsed * 100 / metrics.gpuVramTotal))
+  }
+
+  function gpuTemperatureMeter() {
+    if (metrics.gpuTemperature < 0) return -1
+    var span = 95 - temperatureFloor
+    return Math.max(0, Math.min(100, (metrics.gpuTemperature - temperatureFloor) * 100 / span))
+  }
+
   function temperatureText() {
     return metrics.cpuTemperature >= 0 ? Math.round(metrics.cpuTemperature) + "°C" : "—"
   }
@@ -382,6 +393,47 @@ Panel {
               meter: root.temperatureMeter()
               meterColor: root.levelColor(metrics.cpuTemperature, 85, 95)
               alarming: metrics.cpuTemperature >= 95
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground; visible: metrics.gpuAvailable }
+
+          // ---------- GPU ----------
+          // Hidden entirely when discovery found no card, so the panel is
+          // unchanged on machines without a supported GPU.
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: metrics.gpuAvailable
+
+            StatTile {
+              width: (parent.width - parent.spacing * 2) / 3
+              title: "GPU"
+              value: root.percent(metrics.gpuPercent)
+              detail: metrics.gpuName !== "" ? metrics.gpuName : "—"
+              meter: metrics.gpuPercent
+              meterColor: root.levelColor(metrics.gpuPercent, root.warningThreshold, root.criticalThreshold)
+              alarming: metrics.gpuPercent >= root.criticalThreshold
+            }
+
+            StatTile {
+              width: (parent.width - parent.spacing * 2) / 3
+              title: "VRAM"
+              value: root.percent(root.vramPercent())
+              detail: root.formatPair(metrics.gpuVramUsed, metrics.gpuVramTotal)
+              meter: root.vramPercent()
+              meterColor: root.levelColor(root.vramPercent(), root.warningThreshold, root.criticalThreshold)
+              alarming: root.vramPercent() >= root.criticalThreshold
+            }
+
+            StatTile {
+              width: (parent.width - parent.spacing * 2) / 3
+              title: "GPU TEMP"
+              value: metrics.gpuTemperature >= 0 ? Math.round(metrics.gpuTemperature) + "°C" : "—"
+              detail: metrics.gpuPower >= 0 ? Math.round(metrics.gpuPower) + " W" : "—"
+              meter: root.gpuTemperatureMeter()
+              meterColor: root.levelColor(metrics.gpuTemperature, 85, 95)
+              alarming: metrics.gpuTemperature >= 95
             }
           }
 

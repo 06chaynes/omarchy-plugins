@@ -507,6 +507,59 @@ def command_list(_args) -> dict:
     return read_library()
 
 
+WINDOWED_SIZE = (1280, 720)
+
+
+def windowed_config() -> Path:
+    """A RetroArch --appendconfig fragment that forces a real window.
+
+    RetroArch honours video_fullscreen from its own config; appendconfig
+    entries take priority, so this leaves the user's retroarch.cfg untouched.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / "windowed.cfg"
+    width, height = WINDOWED_SIZE
+    path.write_text(
+        # config_save_on_exit: without it RetroArch writes these overrides back
+        # into the user's real retroarch.cfg, so one windowed launch would
+        # reconfigure every future launch.
+        'config_save_on_exit = "false"\n'
+        'video_fullscreen = "false"\n'
+        # Borderless-fullscreen presentation; leaving this on is what makes the
+        # window cover the output even with video_fullscreen off.
+        'video_windowed_fullscreen = "false"\n'
+        # The size keys below are ignored unless this gate is on.
+        'video_window_custom_size_enable = "true"\n'
+        'video_windowed_position_width = "%d"\n'
+        'video_windowed_position_height = "%d"\n'
+        'video_window_save_positions = "false"\n' % (width, height),
+        encoding="utf-8",
+    )
+    return path
+
+
+def settle_window(pid: int, mode: str = "tile") -> None:
+    """Correct the window this pid opens, once it exists.
+
+    Exec-time rules cannot hold here: RetroArch requests fullscreen after its
+    window is mapped, which overrides float/size/fullscreenstate given at map
+    time. The settler waits for the window and fixes it, matching on pid so it
+    can only ever affect the process we just started.
+    """
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return
+    if not shutil.which("hyprctl"):
+        return
+    helper = Path(__file__).resolve().parent / "retro-window-settle"
+    if not helper.is_file():
+        return
+    width, height = WINDOWED_SIZE
+    try:
+        detached([sys.executable, str(helper), str(pid), str(width), str(height), mode])
+    except Exception:
+        pass
+
+
 def command_launch(args) -> dict:
     runtime = detect_runtime()
     game, system = find_game(args.path)
@@ -514,11 +567,16 @@ def command_launch(args) -> dict:
     content = content_file(game["path"])
     if not content.exists():
         raise RuntimeError(f"Game content is missing: {content}")
-    command = runtime["command"] + ["-L", core_path, game["path"]]
+    command = runtime["command"]
+    if getattr(args, "windowed", False):
+        command = command + ["--appendconfig", str(windowed_config())]
+    command = command + ["-L", core_path, game["path"]]
     if args.dry_run:
         return {"ok": True, "dry_run": True, "command": command, "game": game["label"], "core": core_path}
 
     process = detached(command)
+    if getattr(args, "windowed", False):
+        settle_window(process.pid, "float" if getattr(args, "float", False) else "tile")
     state = load_state()
     old = history_index(state).get(game["path"], {})
     history = [entry for entry in state.get("history", []) if entry.get("path") != game["path"]]
@@ -640,6 +698,9 @@ def parser() -> argparse.ArgumentParser:
     launch = commands.add_parser("launch")
     launch.add_argument("--path", required=True)
     launch.add_argument("--core", default="auto")
+    launch.add_argument("--windowed", action="store_true")
+    launch.add_argument("--float", action="store_true",
+                        help="with --windowed, pin to a fixed floating size instead of tiling")
     launch.add_argument("--dry-run", action="store_true")
 
     favorite = commands.add_parser("favorite")

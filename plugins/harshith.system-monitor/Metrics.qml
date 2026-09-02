@@ -28,6 +28,12 @@ Item {
   property real loadFifteen: -1
   property double uptimeSeconds: 0
   property real cpuTemperature: -1
+  property real gpuPercent: -1
+  property real gpuTemperature: -1
+  property real gpuPower: -1
+  property double gpuVramUsed: 0
+  property double gpuVramTotal: 0
+  property string gpuName: ""
   property real networkDownBps: -1
   property real networkUpBps: -1
   property real diskReadBps: -1
@@ -38,12 +44,19 @@ Item {
   property string hostname: ""
   property string autoInterface: ""
   property string cpuTempPath: ""
+  property string gpuBusyPath: ""
+  property string gpuVramUsedPath: ""
+  property string gpuVramTotalPath: ""
+  property string gpuTempPath: ""
+  property string gpuPowerPath: ""
+  readonly property bool gpuAvailable: gpuBusyPath !== ""
   property var diskDevices: []
   property double lastSampleMs: 0
   property double lastFilesystemRefreshMs: 0
 
   property var cpuHistory: []
   property var memoryHistory: []
+  property var gpuHistory: []
   property var networkDownHistory: []
   property var networkUpHistory: []
 
@@ -77,6 +90,11 @@ Item {
     networkFile.reload()
     diskFile.reload()
     if (cpuTempPath !== "") temperatureFile.reload()
+    if (gpuBusyPath !== "") gpuBusyFile.reload()
+    if (gpuVramUsedPath !== "") gpuVramUsedFile.reload()
+    if (gpuVramTotalPath !== "" && gpuVramTotal <= 0) gpuVramTotalFile.reload()
+    if (gpuTempPath !== "") gpuTempFile.reload()
+    if (gpuPowerPath !== "") gpuPowerFile.reload()
 
     var now = Date.now()
     if (panelOpen && !filesystemProc.running && now - lastFilesystemRefreshMs >= 60000) {
@@ -257,6 +275,63 @@ Item {
     onFileChanged: reload()
   }
 
+  FileView {
+    id: gpuBusyFile
+    path: root.gpuBusyPath
+    watchChanges: false
+    printErrors: false
+    onLoaded: {
+      var value = Number(String(text()).trim())
+      if (!isFinite(value) || value < 0) { root.gpuPercent = -1; return }
+      root.gpuPercent = value
+      root.gpuHistory = root.appendHistory(root.gpuHistory, Date.now(), value)
+    }
+    onLoadFailed: root.gpuPercent = -1
+  }
+
+  FileView {
+    id: gpuVramUsedFile
+    path: root.gpuVramUsedPath
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.gpuVramUsed = Number(String(text()).trim()) || 0
+    onLoadFailed: root.gpuVramUsed = 0
+  }
+
+  FileView {
+    id: gpuVramTotalFile
+    path: root.gpuVramTotalPath
+    watchChanges: false
+    printErrors: false
+    onLoaded: root.gpuVramTotal = Number(String(text()).trim()) || 0
+    onLoadFailed: root.gpuVramTotal = 0
+  }
+
+  FileView {
+    id: gpuTempFile
+    path: root.gpuTempPath
+    watchChanges: false
+    printErrors: false
+    onLoaded: {
+      var value = Number(String(text()).trim()) / 1000
+      root.gpuTemperature = isFinite(value) && value > 0 ? value : -1
+    }
+    onLoadFailed: root.gpuTemperature = -1
+  }
+
+  FileView {
+    id: gpuPowerFile
+    path: root.gpuPowerPath
+    watchChanges: false
+    printErrors: false
+    // hwmon reports microwatts.
+    onLoaded: {
+      var value = Number(String(text()).trim()) / 1000000
+      root.gpuPower = isFinite(value) && value > 0 ? value : -1
+    }
+    onLoadFailed: root.gpuPower = -1
+  }
+
   Process {
     id: discoveryProc
     command: ["bash", root.pluginPath + "/discover-sensors.sh"]
@@ -265,6 +340,12 @@ Item {
       onStreamFinished: {
         var discovered = Model.parseDiscovery(text)
         root.cpuTempPath = discovered.cpuTempPath
+        root.gpuBusyPath = discovered.gpuBusyPath
+        root.gpuVramUsedPath = discovered.gpuVramUsedPath
+        root.gpuVramTotalPath = discovered.gpuVramTotalPath
+        root.gpuTempPath = discovered.gpuTempPath
+        root.gpuPowerPath = discovered.gpuPowerPath
+        root.gpuName = discovered.gpuName
         root.diskDevices = discovered.devices
         root.diskSnapshot = null
         if (root.cpuTempPath !== "") temperatureFile.reload()

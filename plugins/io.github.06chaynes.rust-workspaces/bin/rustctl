@@ -32,12 +32,24 @@ EXCLUDE_DIR_NAMES = {
     ".idea", ".vscode", "pkg", "dist", "tmp", "__pycache__"
 }
 
+def normalize_root(path_str: str) -> str:
+    return str(Path(os.path.expanduser(str(path_str))).resolve())
+
 def load_config() -> dict:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
+            # Roots were once stored unexpanded ("~/Projects"). add/remove
+            # expand before comparing, so a tilde entry could never be matched
+            # and removing it silently did nothing. Normalize on load and
+            # rewrite, which also drops duplicates left by that mismatch.
+            roots = list(dict.fromkeys(normalize_root(r) for r in cfg.get("scanRoots", [])))
+            if roots != cfg.get("scanRoots"):
+                cfg["scanRoots"] = roots
+                save_config(cfg)
+            return cfg
         except Exception:
             pass
             
@@ -72,9 +84,18 @@ def format_bytes(bytes_num: int) -> str:
         i += 1
     return f"{val:.1f} {units[i]}"
 
-def get_dir_size_fast(path: Path, max_depth: int = 20) -> int:
+def get_dir_size_fast(path: Path, max_depth: int = 20, seen: Optional[set] = None) -> int:
+    """Sum a directory, charging each inode once.
+
+    Cargo hardlinks artifacts between target/<profile>/deps and
+    target/<profile>, so summing every directory entry counts the same bytes
+    repeatedly. Pass a shared `seen` set across sibling target dirs to keep
+    links that span them from being counted twice.
+    """
     if not path.is_dir():
         return 0
+    if seen is None:
+        seen = set()
     total = 0
     stack = [(path, 0)]
     while stack:
@@ -86,7 +107,13 @@ def get_dir_size_fast(path: Path, max_depth: int = 20) -> int:
                 for entry in it:
                     try:
                         if entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
+                            st = entry.stat(follow_symlinks=False)
+                            if st.st_nlink > 1:
+                                key = (st.st_dev, st.st_ino)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                            total += st.st_size
                         elif entry.is_dir(follow_symlinks=False):
                             stack.append((Path(entry.path), depth + 1))
                     except (OSError, PermissionError):
@@ -145,45 +172,78 @@ def get_newest_mtime_fast(path: Path, max_depth: int = 8) -> float:
             continue
     return newest
 
+def read_config_target_dir(cfg_path: Path) -> Optional[str]:
+    """Return build.target-dir from a cargo config, or None.
+
+    Tracks the current table so a `target-dir` key under some other section is
+    not mistaken for the build one, and strips comments so a commented-out
+    setting does not register.
+    """
+    if not cfg_path.is_file():
+        return None
+    section = ""
+    try:
+        for raw in cfg_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if section == "build" and line.split("=", 1)[0].strip() == "target-dir":
+                return line.split("=", 1)[1].strip().strip('"\'')
+    except OSError:
+        return None
+    return None
+
 def resolve_target_dirs(ws_dir: Path) -> List[Path]:
-    targets = []
-    
-    # 1. Standard local target directory
-    local_target = ws_dir / "target"
-    if local_target.is_dir():
-        targets.append(local_target)
-        
-    # 2. Check for .cargo/config.toml or .cargo/config
-    for cfg_path in [ws_dir / ".cargo" / "config.toml", ws_dir / ".cargo" / "config"]:
-        if cfg_path.is_file():
-            try:
-                for line in cfg_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                    if "target-dir" in line and "=" in line:
-                        val = line.split("=", 1)[1].strip().strip('"\'')
-                        p = Path(os.path.expanduser(val))
-                        if not p.is_absolute():
-                            p = (ws_dir / p).resolve()
-                        if p.is_dir() and p not in targets:
-                            targets.append(p)
-            except Exception:
-                pass
-                
-    # 3. Check CARGO_TARGET_DIR env var
+    """Locate the target directories whose bytes this workspace can reclaim.
+
+    A target dir set globally (~/.cargo/config.toml or CARGO_TARGET_DIR) is
+    shared by every workspace on the machine and cargo does not namespace it,
+    so its bytes cannot be attributed to any single workspace. Those are only
+    counted when a per-workspace subdirectory exists inside them.
+    """
+    targets: List[Path] = []
+
+    def add(p: Optional[Path]):
+        if p is not None and p.is_dir() and p not in targets:
+            targets.append(p)
+
+    # 1. Standard local target directory.
+    add(ws_dir / "target")
+
+    # 2. build.target-dir from the workspace's own cargo config. This one is
+    #    scoped to this workspace, so the whole directory belongs to it.
+    for cfg_path in (ws_dir / ".cargo" / "config.toml", ws_dir / ".cargo" / "config"):
+        val = read_config_target_dir(cfg_path)
+        if val is None:
+            continue
+        p = Path(os.path.expanduser(val))
+        if not p.is_absolute():
+            p = (ws_dir / p).resolve()
+        add(p)
+        break
+
+    # 3. Shared roots: the global cargo config and CARGO_TARGET_DIR. Attribute
+    #    only a subdirectory named for this workspace, never the shared root.
+    shared: List[str] = []
+    for cfg_path in (Path(os.path.expanduser("~/.cargo/config.toml")),
+                     Path(os.path.expanduser("~/.cargo/config"))):
+        val = read_config_target_dir(cfg_path)
+        if val is not None:
+            shared.append(val)
+            break
     env_target = os.environ.get("CARGO_TARGET_DIR")
     if env_target:
-        p = Path(os.path.expanduser(env_target)).resolve()
-        if p.is_dir():
-            if p.name == ws_dir.name and p not in targets:
-                targets.append(p)
-            elif (p / ws_dir.name).is_dir() and (p / ws_dir.name) not in targets:
-                targets.append(p / ws_dir.name)
-                
-    # 4. Check common shared cargo target directory roots
-    for root_candidate in ["/workspace/cargo-target", os.path.expanduser("~/.cargo/target")]:
-        cand = Path(root_candidate) / ws_dir.name
-        if cand.is_dir() and cand not in targets:
-            targets.append(cand)
-            
+        shared.append(env_target)
+
+    for val in shared:
+        root = Path(os.path.expanduser(val))
+        if not root.is_absolute():
+            continue
+        add(root / ws_dir.name)
+
     return targets
 
 def parse_cargo_toml(path: Path) -> dict:
@@ -290,7 +350,8 @@ def scan_all() -> dict:
         meta = parse_cargo_toml(cargo_file)
         
         target_dirs = resolve_target_dirs(ws_dir)
-        target_bytes = sum(get_dir_size_fast(t) for t in target_dirs)
+        target_seen = set()
+        target_bytes = sum(get_dir_size_fast(t, seen=target_seen) for t in target_dirs)
         total_reclaimable_bytes += target_bytes
         
         # Real recursive source size across all member crates
@@ -335,6 +396,7 @@ def scan_all() -> dict:
         "totalSourceBytes": total_source_bytes,
         "totalSourceDisplay": format_bytes(total_source_bytes),
         "scanRoots": scan_roots,
+        "staleDaysThreshold": cfg.get("staleDaysThreshold", 14),
         "workspaces": workspaces,
         "updatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
@@ -346,25 +408,53 @@ def scan_all() -> dict:
         
     return summary
 
-def clean_workspace(path_str: str) -> dict:
+CACHEDIR_TAG_SIGNATURE = "Signature: 8a477f597d28d172789f06886806bc55"
+
+def is_cargo_target_dir(path: Path) -> bool:
+    """Confirm a directory really is a cargo target dir.
+
+    build.target-dir can name any path, so a repository's own config could
+    aim the cleaner at a home directory. Cargo stamps every target dir it
+    creates with a CACHEDIR.TAG, which is exactly the marker needed here.
+    """
+    tag = path / "CACHEDIR.TAG"
+    try:
+        if tag.is_file():
+            with open(tag, "r", encoding="utf-8", errors="ignore") as f:
+                return f.readline().strip() == CACHEDIR_TAG_SIGNATURE
+    except OSError:
+        pass
+    return False
+
+def is_safe_to_remove(target: Path, ws_dir: Path) -> bool:
+    # The conventional location is trusted outright, which also covers dirs
+    # left by cargo versions predating CACHEDIR.TAG. Anything else has to
+    # prove itself.
+    return target == ws_dir / "target" or is_cargo_target_dir(target)
+
+def clean_workspace(path_str: str, rescan: bool = True) -> dict:
     p = Path(path_str).resolve()
     if not p.is_dir() or not (p / "Cargo.toml").is_file():
         return {"ok": False, "error": f"Invalid Rust workspace directory: {path_str}"}
-        
+
     target_dirs = resolve_target_dirs(p)
     if not target_dirs:
-        return {"ok": True, "reclaimedBytes": 0, "reclaimedDisplay": "0 B"}
-        
-    reclaimed_bytes = sum(get_dir_size_fast(t) for t in target_dirs)
+        return {"ok": True, "reclaimedBytes": 0, "reclaimedDisplay": "0 B", "skipped": []}
+
+    removable = [t for t in target_dirs if is_safe_to_remove(t, p)]
+    skipped = [str(t) for t in target_dirs if t not in removable]
+
+    # Size each dir separately so a partial failure can be reported honestly.
+    seen = set()
+    sizes = {t: get_dir_size_fast(t, seen=seen) for t in removable}
+    reclaimed_bytes = sum(sizes.values())
+
     cfg = load_config()
-    use_cargo = cfg.get("useCargoClean", True)
-    
-    # 1. Run cargo clean if available
-    if use_cargo and shutil.which("cargo"):
-        try:
-            for t in target_dirs:
-                clean_env = os.environ.copy()
-                clean_env["CARGO_TARGET_DIR"] = str(t)
+    if cfg.get("useCargoClean", True) and shutil.which("cargo"):
+        for t in removable:
+            clean_env = os.environ.copy()
+            clean_env["CARGO_TARGET_DIR"] = str(t)
+            try:
                 subprocess.run(
                     ["cargo", "clean", "--manifest-path", str(p / "Cargo.toml")],
                     cwd=str(p),
@@ -373,32 +463,37 @@ def clean_workspace(path_str: str) -> dict:
                     timeout=30,
                     check=False
                 )
-        except Exception:
-            pass
-            
-    # 2. Force remove target directories
-    for t in target_dirs:
-        if t.is_dir():
-            try:
-                shutil.rmtree(t, ignore_errors=True)
-            except Exception as e:
-                return {"ok": False, "error": f"Failed to remove {t}: {e}"}
-                
-    # Trigger full rescan to update cache
-    updated_summary = scan_all()
-    
-    return {
-        "ok": True,
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+    # rmtree(ignore_errors=True) never raises, so the only honest way to know
+    # whether the bytes were actually reclaimed is to look afterwards.
+    failed = []
+    for t in removable:
+        if not t.is_dir():
+            continue
+        shutil.rmtree(t, ignore_errors=True)
+        if t.exists():
+            failed.append(str(t))
+            reclaimed_bytes -= sizes.get(t, 0)
+
+    result = {
+        "ok": not failed,
         "reclaimedBytes": reclaimed_bytes,
         "reclaimedDisplay": format_bytes(reclaimed_bytes),
-        "summary": updated_summary
+        "skipped": skipped
     }
+    if failed:
+        result["error"] = "Could not remove: " + ", ".join(failed)
+    if rescan:
+        result["summary"] = scan_all()
+    return result
 
 def clean_batch_workspaces(paths: List[str]) -> dict:
     total_reclaimed = 0
     cleaned_count = 0
     for p in paths:
-        res = clean_workspace(p)
+        res = clean_workspace(p, rescan=False)
         if res.get("ok"):
             total_reclaimed += res.get("reclaimedBytes", 0)
             cleaned_count += 1
@@ -419,11 +514,11 @@ def clean_all_workspaces(filter_stale_days: Optional[int] = None) -> dict:
     for ws in summary["workspaces"]:
         if not ws["hasTarget"]:
             continue
-        if filter_stale_days is not None and ws["daysSinceBuild"] >= 0:
-            if ws["daysSinceBuild"] < filter_stale_days:
+        if filter_stale_days is not None:
+            if ws["daysSinceBuild"] < 0 or ws["daysSinceBuild"] < filter_stale_days:
                 continue
                 
-        res = clean_workspace(ws["path"])
+        res = clean_workspace(ws["path"], rescan=False)
         if res.get("ok"):
             total_reclaimed += res.get("reclaimedBytes", 0)
             cleaned_count += 1
@@ -449,7 +544,7 @@ def get_cached_summary() -> dict:
 
 def add_scan_root(path_str: str) -> dict:
     cfg = load_config()
-    exp = str(Path(os.path.expanduser(path_str)).resolve())
+    exp = normalize_root(path_str)
     if exp not in cfg["scanRoots"]:
         cfg["scanRoots"].append(exp)
         save_config(cfg)
@@ -457,7 +552,7 @@ def add_scan_root(path_str: str) -> dict:
 
 def remove_scan_root(path_str: str) -> dict:
     cfg = load_config()
-    exp = str(Path(os.path.expanduser(path_str)).resolve())
+    exp = normalize_root(path_str)
     if exp in cfg["scanRoots"]:
         cfg["scanRoots"].remove(exp)
         save_config(cfg)
